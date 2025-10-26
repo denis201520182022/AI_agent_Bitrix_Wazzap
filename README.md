@@ -26,3 +26,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Название: Долгосрок (6 месяцев не подходит) | ID: C11:1
 --------------------------------------------------
 (venv) PS D:\мое\забота\Wazzup_Bitrix> 
+
+
+
+Че перенести надо
+
+.env
+credentials.json
+alembic.ini

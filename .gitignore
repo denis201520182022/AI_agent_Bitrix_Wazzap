@@ -14,3 +14,6 @@ __pycache__/
 
 # ... (все предыдущие строки)
 credentials.json
+
+test/
+alembic.ini

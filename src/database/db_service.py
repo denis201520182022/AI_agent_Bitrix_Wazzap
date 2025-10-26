@@ -1,7 +1,7 @@
 # src/database/db_service.py
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, or_
 from datetime import datetime, timedelta
 from .models import Dialog
 
@@ -31,17 +31,24 @@ def get_or_create_dialog(db: Session, chat_id: str, deal_id: int = None, manager
     db.refresh(dialog)
     return dialog
 
-def update_dialog(db: Session, chat_id: str, new_state: str, new_history: list):
+
+def update_dialog(db: Session, chat_id: str, new_state: str, new_history: list, needs_reminder: bool = False):
     """
     Комплексно обновляет диалог: устанавливает новое состояние и перезаписывает историю.
+    Теперь также управляет флагом напоминания.
     """
     dialog = db.query(Dialog).filter(Dialog.chat_id == chat_id).first()
     if dialog:
         dialog.current_state = new_state
         dialog.history = new_history
         flag_modified(dialog, "history")
+        
+        # Сбрасываем уровень напоминания при любом обновлении, но выставляем флаг, если нужно
+        dialog.reminder_level = 0 
+        dialog.needs_reminder = needs_reminder
+        
         db.commit()
-        print(f"Диалог {chat_id} обновлен. Новое состояние: '{new_state}'.")
+        print(f"Диалог {chat_id} обновлен. Новое состояние: '{new_state}'. Напоминание: {needs_reminder}")
     else:
         print(f"⚠️ Попытка обновить несуществующий диалог: {chat_id}")
 
@@ -56,6 +63,30 @@ def add_message_to_history(db: Session, chat_id: str, role: str, content: str):
     flag_modified(dialog, "history")
     db.commit()
     print(f"Сообщение от '{role}' сохранено в историю для chat_id: {chat_id}")
+
+def log_user_message(db: Session, chat_id: str, content: str):
+    """Логирует сообщение от пользователя в full_log."""
+    dialog = get_or_create_dialog(db, chat_id)
+    log_entry = {
+        "type": "user_message",
+        "timestamp": datetime.now().isoformat(),
+        "content": content
+    }
+    dialog.full_log.append(log_entry)
+    flag_modified(dialog, "full_log")
+    db.commit()
+
+def log_llm_response(db: Session, chat_id: str, llm_response_json: dict):
+    """Логирует полный JSON-ответ от LLM в full_log."""
+    dialog = get_or_create_dialog(db, chat_id)
+    log_entry = {
+        "type": "llm_response",
+        "timestamp": datetime.now().isoformat(),
+        "response": llm_response_json
+    }
+    dialog.full_log.append(log_entry)
+    flag_modified(dialog, "full_log")
+    db.commit()
 
 def get_dialog_history(db: Session, chat_id: str) -> list:
     """
@@ -112,3 +143,33 @@ def get_and_clear_pending_dialogs(db: Session, delay_seconds: int = 10) -> list[
     
     db.commit()
     return results
+
+# src/database/db_service.py
+
+def get_due_reminders(db: Session) -> list[Dialog]:
+    """Находит диалоги, которые требуют напоминания прямо сейчас."""
+    # Находим диалоги, где флаг needs_reminder=True и updated_at прошло достаточно времени
+    
+    # Условие для 1-го напоминания (прошел 1 час)
+    remind_level_1 = and_(Dialog.reminder_level == 0, Dialog.updated_at < datetime.now() - timedelta(hours=1))
+    
+    # Условие для 2-го напоминания (прошло 3 часа с последнего обновления)
+    remind_level_2 = and_(Dialog.reminder_level == 1, Dialog.updated_at < datetime.now() - timedelta(hours=3))
+
+    # Условие для 3-го напоминания (прошло 24 часа)
+    remind_level_3 = and_(Dialog.reminder_level == 2, Dialog.updated_at < datetime.now() - timedelta(days=1))
+
+    dialogs_to_remind = db.query(Dialog).filter(
+        Dialog.needs_reminder == True,
+        or_(remind_level_1, remind_level_2, remind_level_3) # <--- ИСПРАВЛЕНО
+    ).all()
+    
+    return dialogs_to_remind
+
+def has_pending_messages(db: Session, chat_id: str) -> bool:
+    """Проверяет, есть ли сообщения в очереди для данного чата."""
+    count = db.query(Dialog).filter(
+    Dialog.chat_id == chat_id,
+    func.jsonb_array_length(Dialog.pending_messages) > 0
+    ).count()
+    return count > 0

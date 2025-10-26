@@ -13,6 +13,8 @@ from database import db_service
 from database.db import SessionLocal
 from services import bitrix_service, wazzup_service, llm_service, prompt_service
 from utils import parse_form_data, normalize_phone
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 # --- ЗАГРУЗКА НАСТРОЕК ИЗ .ENV ---
 # ID воронки "Постоянные" (согласно вашему .env)
@@ -54,7 +56,8 @@ async def process_pending_messages_worker():
                 
                 # Отправляем весь контекст "мозгу" с полным промптом
                 llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
-
+                if llm_decision:
+                    db_service.log_llm_response(db, dialog.chat_id, llm_decision)
 
                 if not llm_decision:
                     print(f"❌ LLM не вернул решение для диалога {dialog.chat_id}. Пропускаем.")
@@ -100,9 +103,17 @@ async def process_pending_messages_worker():
                     reason = comment or "Причина эскалации не указана."
                     bitrix_service.escalate_deal_to_manager(deal_id, manager_id, reason)
 
-                # --- 4. ОБНОВЛЕНИЕ ДИАЛОГА В БД ---
-                # Сохраняем новое состояние и всю обновленную историю
-                db_service.update_dialog(db, dialog.chat_id, new_state, current_history)
+                                # --- 4. ОБНОВЛЕНИЕ ДИАЛОГА В БД ---
+                # Определяем, нужно ли включать напоминания
+                # Мы включаем их, если бот переходит в состояние ожидания ответа
+                states_that_need_reminders = [
+                    "awaiting_initial_response", "awaiting_debtor_clarification", 
+                    "awaiting_debtor_details", "awaiting_new_lot_response",
+                    "awaiting_touch_today_response"
+                ]
+                should_remind = new_state in states_that_need_reminders
+
+                db_service.update_dialog(db, dialog.chat_id, new_state, current_history, needs_reminder=should_remind)
                 print(f"  - Диалог {dialog.chat_id} переведен в состояние '{new_state}'.")
             
             db.close() # Закрываем сессию после обработки всей пачки
@@ -115,13 +126,98 @@ async def process_pending_messages_worker():
         # Пауза перед следующей проверкой очереди
         await asyncio.sleep(5)
 
+async def reminder_worker():
+    """Этот воркер запускается по расписанию и проверяет, кому пора напомнить."""
+    print("⏰ Воркер-НАПОМИНАТОР запущен!")
+    db = SessionLocal()
+    
+    try:
+        dialogs_to_remind = db_service.get_due_reminders(db)
+        if not dialogs_to_remind:
+            print("  - Нет диалогов для напоминания.")
+            return
+
+        print(f"  - Найдено {len(dialogs_to_remind)} диалогов для напоминания.")
+        
+        for dialog in dialogs_to_remind:
+            # Получаем базовую инфу для LLM
+            deal_details = bitrix_service.get_deal_details(dialog.deal_id)
+            client_name = bitrix_service.get_contact_details(deal_details.get("CONTACT_ID")).get("NAME", "Уважаемый клиент")
+
+            # Определяем, какое напоминание отправлять
+            reminder_level = dialog.reminder_level
+            if reminder_level == 0:
+                instruction = "initiate_reminder_1h"
+            elif reminder_level == 1:
+                instruction = f"initiate_reminder_3h. ИМЯ_КЛИЕНТА: {client_name}."
+            elif reminder_level == 2:
+                instruction = f"initiate_reminder_24h. ИМЯ_КЛИЕНТА: {client_name}."
+            else:
+                continue # Пропускаем, если уровень уже максимальный
+
+            print(f"    - Отправка напоминания уровня {reminder_level + 1} для {dialog.chat_id}")
+
+            # Финальная проверка: если в очереди есть сообщения от клиента, отменяем напоминание
+            if db_service.has_pending_messages(db, dialog.chat_id):
+                print(f"    - ОТМЕНА: Клиент ответил. Сбрасываем напоминания для {dialog.chat_id}")
+                dialog.needs_reminder = False
+                dialog.reminder_level = 0
+                db.commit()
+                continue
+            
+            # Если ответов нет, отправляем напоминание
+            prompt_library = prompt_service.get_prompt_library()
+            all_prompts_text = "\n\n".join(prompt_library.values())
+            
+            llm_decision = await llm_service.get_bot_decision(
+                [{"role": "system", "content": instruction}], 
+                all_prompts_text
+            )
+            
+            reminder_text = llm_decision.get("response_text")
+            if reminder_text:
+                success = wazzup_service.send_message(dialog.chat_id, reminder_text)
+                if success:
+                    # Увеличиваем уровень напоминания и обновляем диалог
+                    dialog.reminder_level += 1
+                    db_service.add_message_to_history(db, dialog.chat_id, "assistant", reminder_text)
+
+            # Если это было последнее напоминание (уровень стал 3) - эскалация
+            if dialog.reminder_level >= 3:
+                print(f"    - ПОСЛЕДНЕЕ НАПОМИНАНИЕ. Эскалация на менеджера для {dialog.chat_id}")
+                bitrix_service.escalate_deal_to_manager(
+                    dialog.deal_id, 
+                    dialog.manager_id, 
+                    "Клиент не отвечает на автоматические напоминания в чате."
+                )
+                dialog.needs_reminder = False # Выключаем дальнейшие напоминания
+
+            db.commit()
+
+    finally:
+        db.close()
+
 # --- УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ ПРИЛОЖЕНИЯ ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Приложение запускается...")
+    
+    # Настраиваем хранилище задач в нашей БД
+    jobstores = {
+        'default': SQLAlchemyJobStore(url=os.getenv("DATABASE_URL"))
+    }
+    # Создаем и запускаем планировщик
+    scheduler = AsyncIOScheduler(jobstores=jobstores)
+    scheduler.add_job(reminder_worker, 'interval', minutes=1, id='reminder_job', replace_existing=True)
+    scheduler.start()
+    
+    # Запускаем наш старый воркер
     worker_task = asyncio.create_task(process_pending_messages_worker())
+    
     yield
+    
     print("Приложение останавливается...")
+    scheduler.shutdown()
     worker_task.cancel()
     try:
         await worker_task
@@ -191,7 +287,8 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         prompt_library = prompt_service.get_prompt_library()
         all_prompts_text = "\n\n".join(prompt_library.values())
         llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
-
+        if llm_decision:
+            db_service.log_llm_response(db, client_phone, llm_decision)
         if not llm_decision:
             print(f"❌ ОСТАНОВКА: LLM не вернул решение для инициации диалога по сделке {deal_id}.")
             return {"status": "error", "message": "LLM failed to provide initial decision"}
@@ -216,7 +313,15 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         current_history = db_service.get_dialog_history(db, client_phone)
         if response_text:
             current_history.append({"role": "assistant", "content": response_text})
-        db_service.update_dialog(db, client_phone, new_state, current_history)
+                # Определяем, нужно ли включать напоминания
+        states_that_need_reminders = [
+            "awaiting_initial_response", "awaiting_debtor_clarification", 
+            "awaiting_debtor_details", "awaiting_new_lot_response",
+            "awaiting_touch_today_response"
+        ]
+        should_remind = new_state in states_that_need_reminders
+
+        db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)
         print(f"✅ Сценарий №1 для сделки {deal_id} успешно запущен.")
 
     # --- Сценарий №2: Уведомление о новом лоте ---
@@ -252,12 +357,13 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         # --- Запуск LLM ---
         initial_instruction = {
             "role": "system",
-            "content": f"initiate_new_lot_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}. НАЗВАНИЕ_ДОЛЖНИКА: {debtor_name_info}."
+            "content": f"initiate_new_lot_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}. ИНФОРМАЦИЯ О ДОЛЖНИКЕ: {debtor_name_info}."
         }
         prompt_library = prompt_service.get_prompt_library()
         all_prompts_text = "\n\n".join(prompt_library.values())
         llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
-        
+        if llm_decision:
+            db_service.log_llm_response(db, client_phone, llm_decision)
         if not llm_decision:
             print(f"❌ ОСТАНОВКА: LLM не вернул решение для сценария 'Новый лот' по сделке {deal_id}.")
             return {"status": "error", "message": "LLM failed"}
@@ -282,7 +388,15 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         current_history = db_service.get_dialog_history(db, client_phone)
         if response_text:
             current_history.append({"role": "assistant", "content": response_text})
-        db_service.update_dialog(db, client_phone, new_state, current_history)
+                # Определяем, нужно ли включать напоминания
+        states_that_need_reminders = [
+            "awaiting_initial_response", "awaiting_debtor_clarification", 
+            "awaiting_debtor_details", "awaiting_new_lot_response",
+            "awaiting_touch_today_response"
+        ]
+        should_remind = new_state in states_that_need_reminders
+
+        db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)
         print(f"✅ Сценарий 'Новый лот' для сделки {deal_id} успешно запущен.")
 
     # --- Сценарий №3: Касание сегодня ---
@@ -314,7 +428,8 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         prompt_library = prompt_service.get_prompt_library()
         all_prompts_text = "\n\n".join(prompt_library.values())
         llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
-        
+        if llm_decision:
+            db_service.log_llm_response(db, client_phone, llm_decision)
         if not llm_decision:
             print(f"❌ ОСТАНОВКА: LLM не вернул решение для сценария 'Касание сегодня' по сделке {deal_id}.")
             return {"status": "error", "message": "LLM failed"}
@@ -339,7 +454,15 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         current_history = db_service.get_dialog_history(db, client_phone)
         if response_text:
             current_history.append({"role": "assistant", "content": response_text})
-        db_service.update_dialog(db, client_phone, new_state, current_history)
+        # Определяем, нужно ли включать напоминания
+        states_that_need_reminders = [
+            "awaiting_initial_response", "awaiting_debtor_clarification", 
+            "awaiting_debtor_details", "awaiting_new_lot_response",
+            "awaiting_touch_today_response"
+        ]
+        should_remind = new_state in states_that_need_reminders
+
+        db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)
         print(f"✅ Сценарий 'Касание сегодня' для сделки {deal_id} успешно запущен.")
 
     return {"status": "ok", "message": "Webhook processed"}
@@ -360,6 +483,7 @@ async def handle_wazzup_webhook(request: Request, db: Session = Depends(get_db))
     
     if text and chat_id:
         normalized_phone = normalize_phone(chat_id)
+        db_service.log_user_message(db, normalized_phone, text)
         db_service.add_pending_message(db, normalized_phone, text)
         print(f">>> Сообщение от {normalized_phone} добавлено в очередь.")
     
