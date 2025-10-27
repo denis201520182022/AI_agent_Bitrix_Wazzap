@@ -1,197 +1,193 @@
 import os
 import requests
+import logging
 from datetime import datetime, timedelta
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
+
+# --- Настройка логирования ---
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# --- Настройка ретраев для Bitrix24 ---
+# В случае HTTP-ошибок (4xx, 5xx), сетевых проблем
+bitrix_retry_decorator = retry(
+    stop=stop_after_attempt(3), # Повторить 3 раза
+    wait=wait_fixed(2),         # Ждать 2 секунды между попытками
+    retry=retry_if_exception_type(requests.exceptions.RequestException), # Повторять при ошибках Requests
+    before_sleep=before_sleep_log(logger, logging.WARNING), # Логировать перед каждой повторной попыткой
+    reraise=True # Пробросить исключение, если все попытки неудачны
+)
 
 # Получаем базовый URL вебхука из переменных окружения
 BASE_URL = os.getenv("BITRIX_WEBHOOK_URL")
 
 
-def get_deals(limit: int = 5):
+@bitrix_retry_decorator
+def _make_bitrix_request(method_url: str, params: dict = None) -> dict | None:
+    """
+    Внутренняя вспомогательная функция для выполнения POST-запросов к Bitrix24 API
+    с общей обработкой ошибок и ретраями.
+    """
+    if not BASE_URL:
+        logger.error("❌ Ошибка: URL вебхука для Битрикс24 не задан в .env. Запрос не выполнен.")
+        return None
+
+    full_url = f"{BASE_URL}{method_url}"
+    
+    try:
+        logger.debug(f"Выполнение запроса к Bitrix24: {full_url}, параметры: {params}")
+        response = requests.post(full_url, json=params)
+        response.raise_for_status() # Вызовет исключение для HTTP-ошибок 4xx/5xx
+        data = response.json()
+        
+        if 'error' in data:
+            # Bitrix API может возвращать HTTP 200, но с ошибкой в теле JSON
+            error_code = data.get('error')
+            error_description = data.get('error_description', 'Неизвестная ошибка Bitrix API')
+            logger.error(f"❌ Ошибка Bitrix API (код: {error_code}): %s при запросе к {method_url}", error_description)
+            return None
+        
+        logger.debug(f"Успешный ответ от Bitrix24 для {method_url}")
+        return data
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Ошибка сетевого запроса к Bitrix24 после всех ретраев ({method_url}): %s", e)
+        if e.response is not None:
+            logger.error(f"   Ответ сервера Bitrix24: %s", e.response.text)
+        raise # Перепробрасываем исключение для tenacity
+    except Exception as e:
+        logger.critical(f"❌ КРИТИЧЕСКАЯ НЕИЗВЕСТНАЯ ОШИБКА при запросе к Bitrix24 ({method_url}): %s", e)
+        raise # Перепробрасываем исключение для tenacity
+
+
+def get_deals(limit: int = 5) -> list | None:
     """
     Получает 'limit' последних сделок из Битрикс24.
     """
-    if not BASE_URL:
-        print("❌ Ошибка: URL вебхука для Битрикс24 не задан в .env")
-        return None
-
-    # Формируем полный URL для метода crm.deal.list
-    method_url = f"{BASE_URL}crm.deal.list.json"
-
-    # Параметры для запроса: сортируем по ID по убыванию, чтобы получить самые новые
-    params = {
-        'order': {"ID": "DESC"},
-        'select': ["ID", "TITLE", "STAGE_ID"],  # Запрашиваем только нужные поля
-    }
-
-    try:
-        # Отправляем POST-запрос
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()  # Вызовет ошибку, если HTTP-статус не 2xx
-
-        data = response.json()
-
-        if 'result' in data and data['result']:
-            # API вернет страницу результатов, мы берем нужное количество
-            return data['result'][:limit]
-        else:
-            print("⚠️ В ответе от Битрикс24 нет данных о сделках. Возможно, их просто нет?")
-            print("Ответ API:", data)
-            return []
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при запросе к API Битрикс24: {e}")
-        return None
+    logger.info(f"Запрос {limit} последних сделок из Битрикс24.")
+    data = _make_bitrix_request(
+        "crm.deal.list.json",
+        params={
+            'order': {"ID": "DESC"},
+            'select': ["ID", "TITLE", "STAGE_ID"],
+            'limit': limit # Добавляем лимит для более эффективного запроса
+        }
+    )
+    if data and 'result' in data:
+        logger.info(f"✅ Получено {len(data['result'])} сделок.")
+        return data['result']
+    else:
+        logger.warning("⚠️ В ответе от Битрикс24 нет данных о сделках. Возможно, их просто нет?")
+        return []
 
 
-def get_deal_details(deal_id: int):
+def get_deal_details(deal_id: int) -> dict | None:
     """
     Получает детальную информацию о сделке по ее ID.
     """
-    if not BASE_URL:
-        print("❌ Ошибка: URL вебхука для Битрикс24 не задан в .env")
-        return None
-
-    method_url = f"{BASE_URL}crm.deal.get.json"
-    params = {'id': deal_id}
-
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        data = response.json()
-
-        if 'result' in data:
-            return data['result']
-        else:
-            print(f"Ошибка при получении деталей сделки {deal_id}:", data)
-            return None
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при запросе деталей сделки {deal_id}: {e}")
+    logger.info(f"Запрос деталей сделки {deal_id}.")
+    data = _make_bitrix_request(
+        "crm.deal.get.json",
+        params={'id': deal_id}
+    )
+    if data and 'result' in data:
+        logger.info(f"✅ Детали сделки {deal_id} получены.")
+        return data['result']
+    else:
+        logger.warning(f"⚠️ Не удалось получить детали сделки {deal_id}. Ответ API: %s", data)
         return None
 
 
-def get_contact_details(contact_id: int):
+def get_contact_details(contact_id: int) -> dict | None:
     """
     Получает детальную информацию о контакте по его ID.
     Целенаправленно запрашивает имя и телефон.
     """
-    if not BASE_URL:
-        return None
-
-    method_url = f"{BASE_URL}crm.contact.get.json"
-    params = {
-        'id': contact_id,
-        'select': ["NAME", "PHONE"]  # Явно запрашиваем только нужные поля
-    }
-
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        data = response.json()
+    logger.info(f"Запрос деталей контакта {contact_id}.")
+    data = _make_bitrix_request(
+        "crm.contact.get.json",
+        params={
+            'id': contact_id,
+            'select': ["NAME", "PHONE"]
+        }
+    )
+    if data and 'result' in data:
+        logger.info(f"✅ Детали контакта {contact_id} получены.")
         return data.get('result')
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при запросе контакта {contact_id}: {e}")
+    else:
+        logger.warning(f"⚠️ Не удалось получить детали контакта {contact_id}. Ответ API: %s", data)
         return None
 
 
-def get_user_details(user_id: int):
+def get_user_details(user_id: int) -> dict | None:
     """
     Получает информацию о пользователе (менеджере) по его ID.
     """
-    if not BASE_URL:
-        return None
-
-    method_url = f"{BASE_URL}user.get.json"
-    params = {'ID': user_id}
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        data = response.json()
-
-        # Метод user.get возвращает массив, даже если пользователь один
-        if 'result' in data and len(data['result']) > 0:
-            return data['result'][0]
-        else:
-            # Более информативное сообщение, если пользователь не найден
-            print(f"ПРЕДУПРЕЖДЕНИЕ: Ответ от Битрикс24 не содержит данных для пользователя {user_id}.")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при запросе пользователя {user_id}: {e}")
+    logger.info(f"Запрос деталей пользователя {user_id}.")
+    data = _make_bitrix_request(
+        "user.get.json",
+        params={'ID': user_id}
+    )
+    if data and 'result' in data and len(data['result']) > 0:
+        logger.info(f"✅ Детали пользователя {user_id} получены.")
+        return data['result'][0]
+    else:
+        logger.warning(f"⚠️ Ответ от Битрикс24 не содержит данных для пользователя {user_id}. Ответ API: %s", data)
         return None
 
 
-def get_latest_activity_for_deal(deal_id: int):
+def get_latest_activity_for_deal(deal_id: int) -> dict | None:
     """
     Получает самое последнее дело (активность), связанное со сделкой.
     """
-    if not BASE_URL:
-        return None
-
-    method_url = f"{BASE_URL}crm.activity.list.json"
-    params = {
-        'order': {"ID": "DESC"},  # Сортируем по ID по убыванию, чтобы самое новое было первым
-        'filter': {
-            "OWNER_TYPE_ID": 2,     # 2 - это системный ID для "Сделки"
-            "OWNER_ID": deal_id     # Ищем дела, привязанные к нашей сделке
-        },
-        'select': ["ID", "DESCRIPTION"]  # Нам нужно только описание
-    }
-
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        data = response.json()
-
-        # API возвращает список, нам нужен только первый (самый новый) элемент
-        if 'result' in data and data['result']:
-            return data['result'][0]
-        else:
-            print(f"ПРЕДУПРЕЖДЕНИЕ: Для сделки {deal_id} не найдено связанных дел/активностей.")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        print(f"Ошибка при запросе дел для сделки {deal_id}: {e}")
+    logger.info(f"Запрос последней активности для сделки {deal_id}.")
+    data = _make_bitrix_request(
+        "crm.activity.list.json",
+        params={
+            'order': {"ID": "DESC"},
+            'filter': {
+                "OWNER_TYPE_ID": 2, # 2 - это системный ID для "Сделки"
+                "OWNER_ID": deal_id
+            },
+            'select': ["ID", "DESCRIPTION"],
+            'limit': 1 # Запрашиваем только одну, самую новую
+        }
+    )
+    if data and 'result' in data and len(data['result']) > 0:
+        logger.info(f"✅ Получена последняя активность для сделки {deal_id}.")
+        return data['result'][0]
+    else:
+        logger.warning(f"⚠️ Для сделки {deal_id} не найдено связанных дел/активностей. Ответ API: %s", data)
         return None
 
 
-def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str):
+def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str) -> int | None:
     """
     Создает новое универсальное дело (crm.activity.todo.add), привязанное к сделке.
     Возвращает ID созданного дела или None в случае ошибки.
     """
-    if not BASE_URL:
-        return None
-
-    method_url = f"{BASE_URL}crm.activity.todo.add.json"
+    logger.info(f"Попытка создания дела для сделки {deal_id}, ответственный {responsible_id}.")
     deadline_time = (datetime.now() + timedelta(hours=3)).strftime('%Y-%m-%dT23:59:59')
 
-    params = {
-        "ownerTypeId": 2,
-        "ownerId": deal_id,
-        "responsibleId": responsible_id,
-        "deadline": deadline_time,
-        "title": subject,
-        "description": description,
-    }
-
-    try:
-        response = requests.post(method_url, json=params)
-        data = response.json()
-
-        # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-        # Правильно извлекаем ID из ответа {'result': {'id': ...}}
-        if 'result' in data and data['result'].get('id'):
-            created_id = data['result']['id']
-            print(f"✅ Успешно создано универсальное дело с ID: {created_id} для сделки {deal_id}")
-            return created_id  # <-- Возвращаем ID, а не None
-        # ------------------------------------
-        else:
-            error_detail = data.get('error_description') or data.get('error')
-            print(f"⚠️ Не удалось создать дело. Ошибка: {error_detail}")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при создании дела для сделки {deal_id}: {e}")
+    data = _make_bitrix_request(
+        "crm.activity.todo.add.json",
+        params={
+            "ownerTypeId": 2,
+            "ownerId": deal_id,
+            "responsibleId": responsible_id,
+            "deadline": deadline_time,
+            "title": subject,
+            "description": description,
+        }
+    )
+    if data and data['result'].get('id'):
+        created_id = data['result']['id']
+        logger.info(f"✅ Успешно создано универсальное дело с ID: {created_id} для сделки {deal_id}")
+        return created_id
+    else:
+        error_detail = data.get('error_description') or data.get('error', 'Неизвестно')
+        logger.error(f"⚠️ Не удалось создать дело для сделки {deal_id}. Ошибка: %s. Ответ API: %s", error_detail, data)
         return None
 
 
@@ -200,23 +196,23 @@ def add_comment_to_deal(deal_id: int, comment_text: str) -> bool:
     Добавляет комментарий в таймлайн сделки.
     Используется для логирования действий бота.
     """
-    if not BASE_URL:
-        return False
-    method_url = f"{BASE_URL}crm.timeline.comment.add.json"
-    params = {
-        'fields': {
-            "ENTITY_ID": deal_id,
-            "ENTITY_TYPE": "deal",
-            "COMMENT": comment_text
+    logger.info(f"Добавление комментария к сделке {deal_id}.")
+    data = _make_bitrix_request(
+        "crm.timeline.comment.add.json",
+        params={
+            'fields': {
+                "ENTITY_ID": deal_id,
+                "ENTITY_TYPE": "deal",
+                "COMMENT": comment_text
+            }
         }
-    }
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        print(f"✅ Комментарий успешно добавлен к сделке {deal_id}")
+    )
+    if data and 'result' in data: # Bitrix возвращает ID комментария или true/false
+        logger.info(f"✅ Комментарий успешно добавлен к сделке {deal_id}")
         return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при добавлении комментария к сделке {deal_id}: {e}")
+    else:
+        error_detail = data.get('error_description') or data.get('error', 'Неизвестно')
+        logger.error(f"❌ Ошибка при добавлении комментария к сделке {deal_id}: %s. Ответ API: %s", error_detail, data)
         return False
 
 
@@ -224,22 +220,22 @@ def move_deal_to_stage(deal_id: int, stage_id: str) -> bool:
     """
     Перемещает сделку на указанную стадию.
     """
-    if not BASE_URL:
-        return False
-    method_url = f"{BASE_URL}crm.deal.update.json"
-    params = {
-        'id': deal_id,
-        'fields': {
-            "STAGE_ID": stage_id
+    logger.info(f"Перемещение сделки {deal_id} на стадию {stage_id}.")
+    data = _make_bitrix_request(
+        "crm.deal.update.json",
+        params={
+            'id': deal_id,
+            'fields': {
+                "STAGE_ID": stage_id
+            }
         }
-    }
-    try:
-        response = requests.post(method_url, json=params)
-        response.raise_for_status()
-        print(f"✅ Сделка {deal_id} успешно перемещена на стадию {stage_id}")
+    )
+    if data and data.get('result') is True: # Bitrix возвращает true при успехе
+        logger.info(f"✅ Сделка {deal_id} успешно перемещена на стадию {stage_id}")
         return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при перемещении сделки {deal_id}: {e}")
+    else:
+        error_detail = data.get('error_description') or data.get('error', 'Неизвестно')
+        logger.error(f"❌ Ошибка при перемещении сделки {deal_id} на стадию {stage_id}: %s. Ответ API: %s", error_detail, data)
         return False
 
 
@@ -249,9 +245,8 @@ def escalate_deal_to_manager(deal_id: int, manager_id: int, reason: str):
     1. Создает дело для менеджера с причиной.
     2. Перемещает сделку на стадию 'Касание сегодня'.
     """
-    print(f"--- НАЧАЛО ПРОЦЕДУРЫ ЭСКАЛАЦИИ для сделки {deal_id} ---")
+    logger.info(f"--- НАЧАЛО ПРОЦЕДУРЫ ЭСКАЛАЦИИ для сделки {deal_id} ---")
 
-    # 1. Формируем и создаем дело
     subject = f"Эскалация от чат-бота: Сделка №{deal_id}"
     description = (f"Требуется внимание менеджера.\n"
                    f"Причина эскалации: {reason}")
@@ -264,15 +259,14 @@ def escalate_deal_to_manager(deal_id: int, manager_id: int, reason: str):
     )
 
     if not activity_created:
-        print("   - ❗️ Не удалось создать дело для эскалации.")
-        # Можно добавить логику уведомления администратора
+        logger.error("   - ❗️ Не удалось создать дело для эскалации.")
+        # Здесь можно добавить логику уведомления администратора, если потребуется
         return
 
-    # 2. Перемещаем сделку (ID стадии берем из .env)
     escalation_stage_id = os.getenv("TOUCH_TODAY_STAGE_ID")
     if escalation_stage_id:
         move_deal_to_stage(deal_id, escalation_stage_id)
     else:
-        print("   - ❗️ Не удалось переместить сделку: переменная TOUCH_TODAY_STAGE_ID не найдена в .env")
+        logger.error("   - ❗️ Не удалось переместить сделку: переменная TOUCH_TODAY_STAGE_ID не найдена в .env")
 
-    print(f"--- ПРОЦЕДУРА ЭСКАЛАЦИИ ЗАВЕРШЕНА ---")
+    logger.info(f"--- ПРОЦЕДУРА ЭСКАЛАЦИИ ЗАВЕРШЕНА для сделки {deal_id} ---")

@@ -1,11 +1,20 @@
-
 # src/services/prompt_service.py
 import os
 import time
 import re
+import logging # Импортируем модуль логирования
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError # Импортируем специфическую ошибку для API Google
 from pathlib import Path
+
+# --- Настройка логирования ---
+logger = logging.getLogger(__name__)
+# В реальном приложении logging.basicConfig лучше вынести в центральный модуль (например, app.py или config.py)
+# Для этого примера оставлю здесь.
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 
 # --- Настройки ---
 MAIN_DOC_ID = os.getenv("GOOGLE_DOC_ID", "1b_EfaKe-iqZG4beYI9lVrCwj2tOMDvK5WqaevJopXVM") 
@@ -29,6 +38,7 @@ def _parse_table_to_markdown(table: dict) -> str:
     markdown_table = []
     rows = table.get('tableRows', [])
     if not rows:
+        logger.debug("Таблица пуста, возвращаем пустую строку.")
         return ""
 
     # Обрабатываем первую строку (заголовок)
@@ -45,6 +55,7 @@ def _parse_table_to_markdown(table: dict) -> str:
         body_cells = [_get_text_from_cell(cell) for cell in row.get('tableCells', [])]
         markdown_table.append(f"| {' | '.join(body_cells)} |")
     
+    logger.debug("Таблица успешно конвертирована в Markdown.")
     return "\n".join(markdown_table)
 
 def _get_text_from_cell(cell: dict) -> str:
@@ -58,16 +69,17 @@ def _get_text_from_cell(cell: dict) -> str:
 
 def _read_and_parse_doc(document_id: str) -> dict:
     """Читает и парсит ОДИН Google Doc, включая таблицы."""
-    if not document_id: return {}
+    if not document_id:
+        logger.warning("ID документа не предоставлен для чтения. Возвращаю пустой словарь.")
+        return {}
         
-    print(f"Читаю Google Doc с ID: ...{document_id[-10:]}")
+    logger.info(f"Читаю Google Doc с ID: ...{document_id[-10:]}")
     try:
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('docs', 'v1', credentials=creds)
         document = service.documents().get(documentId=document_id).execute()
         content = document.get('body').get('content')
         
-        # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: СОБИРАЕМ ТЕКСТ И ТАБЛИЦЫ ---
         full_text = ''
         for value in content:
             if 'paragraph' in value:
@@ -75,14 +87,13 @@ def _read_and_parse_doc(document_id: str) -> dict:
                 for elem in elements:
                     full_text += _get_text_from_element(elem)
             elif 'table' in value:
-                # Если нашли таблицу, конвертируем ее в Markdown и добавляем
                 markdown_table_str = _parse_table_to_markdown(value['table'])
                 full_text += f"\n{markdown_table_str}\n"
-        # --------------------------------------------------------
 
         doc_library = {}
-        markers = re.findall(r"(#\w+#)", full_text)
-        parts = re.split(r"(#\w+#)", full_text)
+        # Используем re.DOTALL, чтобы '.' соответствовал переносам строк
+        markers = re.findall(r"(#\w+#)", full_text, re.DOTALL)
+        parts = re.split(r"(#\w+#)", full_text, re.DOTALL)
 
         for i in range(len(parts)):
             if parts[i] in markers and i + 1 < len(parts):
@@ -91,34 +102,44 @@ def _read_and_parse_doc(document_id: str) -> dict:
                 if text_block:
                     doc_library[marker] = text_block
         
+        logger.info(f"✅ Документ с ID ...{document_id[-10:]} успешно прочитан и распарсен. Найдено {len(doc_library)} блоков.")
         return doc_library
+    except FileNotFoundError:
+        logger.critical(f"❌ ОШИБКА: Файл учетных данных {SERVICE_ACCOUNT_FILE} не найден. Проверьте путь.")
+        return {}
+    except HttpError as e:
+        logger.error(f"❌ ОШИБКА Google Docs API при чтении документа {document_id}: %s (статус: %s)", e, e.resp.status)
+        return {}
     except Exception as e:
-        print(f"❌ ОШИБКА при чтении документа {document_id}: {e}")
+        logger.critical(f"❌ КРИТИЧЕСКАЯ НЕИЗВЕСТНАЯ ОШИБКА при чтении документа {document_id}: %s", e)
         return {}
 
 
-def get_prompt_library():
+def get_prompt_library() -> dict:
     """Читает Основной Промпт и Базу Знаний, объединяет их и кэширует."""
-    # ... (Эта функция остается БЕЗ ИЗМЕНЕНИЙ!)
     global _cached_prompt_library, _cache_timestamp
     if _cached_prompt_library and (time.time() - _cache_timestamp < CACHE_TTL_SECONDS):
+        logger.info("Кэш библиотеки промптов актуален, возвращаю кешированную версию.")
         return _cached_prompt_library
-    print("Кэш библиотеки промптов устарел, обновляю из Google Docs...")
+    
+    logger.info("Кэш библиотеки промптов устарел или отсутствует, обновляю из Google Docs...")
     
     merged_library = {}
     main_prompts = _read_and_parse_doc(MAIN_DOC_ID)
     merged_library.update(main_prompts)
+    
     kb_prompts = _read_and_parse_doc(KNOWLEDGE_BASE_DOC_ID)
     merged_library.update(kb_prompts)
 
     if not merged_library:
-        print("❌ Не удалось загрузить ни одного блока промптов.")
+        logger.error("❌ Не удалось загрузить ни одного блока промптов из Google Docs.")
         if _cached_prompt_library:
-            print("⚠️ Возвращаю старую версию библиотеки из кэша.")
+            logger.warning("⚠️ Возвращаю старую версию библиотеки из кэша, так как загрузка новой провалилась.")
             return _cached_prompt_library
-        return {"#ROLE_AND_STYLE#": "Ты - вежливый ассистент."}
+        logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить промпты и нет доступного кэша. Использую запасной промпт.")
+        return {"#ROLE_AND_STYLE#": "Ты - вежливый ассистент."} # Запасной вариант для минимальной работоспособности
 
-    print(f"✅ Библиотека промптов успешно загружена. Всего найдено блоков: {len(merged_library)}")
+    logger.info(f"✅ Библиотека промптов успешно загружена и кэширована. Всего найдено блоков: {len(merged_library)}")
     _cached_prompt_library = merged_library
     _cache_timestamp = time.time()
     return merged_library
