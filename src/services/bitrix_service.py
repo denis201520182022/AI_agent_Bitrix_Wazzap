@@ -270,3 +270,48 @@ def escalate_deal_to_manager(deal_id: int, manager_id: int, reason: str):
         logger.error("   - ❗️ Не удалось переместить сделку: переменная TOUCH_TODAY_STAGE_ID не найдена в .env")
 
     logger.info(f"--- ПРОЦЕДУРА ЭСКАЛАЦИИ ЗАВЕРШЕНА для сделки {deal_id} ---")
+
+
+
+
+
+def get_contact_details_2(contact_id: int) -> dict | None:
+    """
+    Получает детальную информацию о контакте по его ID.
+    Целенаправленно запрашивает имя и телефон.
+    
+    Возвращает None если контакт не найден (вместо выброса исключения).
+    """
+    logger.info(f"Запрос деталей контакта {contact_id}.")
+    
+    try:
+        data = _make_bitrix_request(
+            "crm.contact.get.json",
+            params={
+                'id': contact_id,
+                'select': ["NAME", "PHONE"]
+            }
+        )
+        
+        if data and 'result' in data:
+            logger.info(f"✅ Детали контакта {contact_id} получены.")
+            return data.get('result')
+        else:
+            logger.warning(f"⚠️ Не удалось получить детали контакта {contact_id}. Ответ API: %s", data)
+            return None
+            
+    except requests.exceptions.HTTPError as e:
+        # Если контакт не найден (404 или 400 с "Not found"), это не критичная ошибка
+        if e.response is not None and e.response.status_code in [400, 404]:
+            error_data = e.response.json() if e.response.text else {}
+            if 'Not found' in error_data.get('error_description', ''):
+                logger.warning(f"⚠️ Контакт {contact_id} не найден в Bitrix24.")
+                return None
+        
+        # Для других HTTP ошибок - пробрасываем дальше
+        logger.error(f"❌ HTTP ошибка при запросе контакта {contact_id}: {e}")
+        raise
+        
+    except Exception as e:
+        logger.error(f"❌ Неожиданная ошибка при запросе контакта {contact_id}: {e}")
+        raise

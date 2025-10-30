@@ -19,7 +19,7 @@ def subscribe_to_wazzup_webhooks():
 
     # --- ВАЖНО: ВСТАВЬТЕ СЮДА ВАШ АКТУАЛЬНЫЙ NGROK URL ---
     # Он должен быть запущен и указывать на ваш порт 8000
-    NGROK_URL = "https://772427ce75da.ngrok-free.app" 
+    NGROK_URL = "https://8c8fffcb1af8.ngrok-free.app" 
     # ---------------------------------------------------------
 
     if "your-unique-url" in NGROK_URL:
@@ -52,6 +52,7 @@ def subscribe_to_wazzup_webhooks():
         print("   Смотрите в консоль, где запущен `python src/main.py`.")
 
     except requests.exceptions.RequestException as e:
+        
         print(f"❌ Ошибка при подписке на вебхуки Wazzup: {e}")
         if e.response:
             print(f"   Ответ сервера: {e.response.text}")

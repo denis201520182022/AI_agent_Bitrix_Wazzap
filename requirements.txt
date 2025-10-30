@@ -18,3 +18,4 @@ alembic
 sqlalchemy
 apscheduler
 tenacity
+redis

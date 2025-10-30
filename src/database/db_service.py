@@ -173,3 +173,15 @@ def has_pending_messages(db: Session, chat_id: str) -> bool:
     func.jsonb_array_length(Dialog.pending_messages) > 0
     ).count()
     return count > 0
+
+
+
+def get_dialog_state(db: Session, chat_id: str) -> str | None:
+    """
+    Получает текущее состояние (current_state) диалога по chat_id.
+    Возвращает строку состояния или None, если диалог не найден.
+    """
+    dialog = db.query(Dialog).filter(Dialog.chat_id == chat_id).first()
+    if dialog:
+        return dialog.current_state
+    return None
