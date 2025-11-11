@@ -1,16 +1,26 @@
 # src/database/db_service.py
-from sqlalchemy.orm import Session
+
+# Импортируем асинхронную сессию и конструктор запросов select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy import func, and_, or_
 from datetime import datetime, timedelta
 from .models import Dialog
 
-def get_or_create_dialog(db: Session, chat_id: str, deal_id: int = None, manager_id: int = None, funnel_id: str = None) -> Dialog:
+# --- ВСЕ ФУНКЦИИ ПЕРЕПИСАНЫ НА АСИНХРОННЫЙ СТИЛЬ ---
+
+async def get_or_create_dialog(db: AsyncSession, chat_id: str, deal_id: int = None, manager_id: int = None, funnel_id: str = None) -> Dialog:
     """
-    Находит диалог по chat_id. Если не находит - создает новый.
+    (Асинхронно) Находит диалог по chat_id. Если не находит - создает новый.
     Если находит, может обновить информацию о сделке.
     """
-    dialog = db.query(Dialog).filter(Dialog.chat_id == chat_id).first()
+    # 1. Создаем запрос с помощью select()
+    stmt = select(Dialog).where(Dialog.chat_id == chat_id)
+    # 2. Выполняем запрос асинхронно
+    result = await db.execute(stmt)
+    # 3. Извлекаем один скалярный (объект) результат
+    dialog = result.scalars().first()
+
     if not dialog:
         dialog = Dialog(
             chat_id=chat_id,
@@ -21,52 +31,53 @@ def get_or_create_dialog(db: Session, chat_id: str, deal_id: int = None, manager
         db.add(dialog)
         print(f"Создан новый диалог в БД для chat_id: {chat_id} (Сделка: {deal_id})")
     else:
-        # Если диалог уже есть, обновляем ID сделки и менеджера, если они переданы
         if deal_id: dialog.deal_id = deal_id
         if manager_id: dialog.manager_id = manager_id
         if funnel_id: dialog.funnel_id = funnel_id
         print(f"Найден существующий диалог для chat_id: {chat_id}. Информация о сделке обновлена.")
 
-    db.commit()
-    db.refresh(dialog)
+    # 4. Коммитим и обновляем объект асинхронно
+    await db.commit()
+    await db.refresh(dialog)
     return dialog
 
 
-def update_dialog(db: Session, chat_id: str, new_state: str, new_history: list, needs_reminder: bool = False):
+async def update_dialog(db: AsyncSession, chat_id: str, new_state: str, new_history: list, needs_reminder: bool = False):
     """
-    Комплексно обновляет диалог: устанавливает новое состояние и перезаписывает историю.
-    Теперь также управляет флагом напоминания.
+    (Асинхронно) Комплексно обновляет диалог: состояние, историю и флаг напоминания.
     """
-    dialog = db.query(Dialog).filter(Dialog.chat_id == chat_id).first()
+    stmt = select(Dialog).where(Dialog.chat_id == chat_id)
+    result = await db.execute(stmt)
+    dialog = result.scalars().first()
+
     if dialog:
         dialog.current_state = new_state
         dialog.history = new_history
         flag_modified(dialog, "history")
         
-        # Сбрасываем уровень напоминания при любом обновлении, но выставляем флаг, если нужно
         dialog.reminder_level = 0 
         dialog.needs_reminder = needs_reminder
         
-        db.commit()
+        await db.commit()
         print(f"Диалог {chat_id} обновлен. Новое состояние: '{new_state}'. Напоминание: {needs_reminder}")
     else:
         print(f"⚠️ Попытка обновить несуществующий диалог: {chat_id}")
 
 
-def add_message_to_history(db: Session, chat_id: str, role: str, content: str):
+async def add_message_to_history(db: AsyncSession, chat_id: str, role: str, content: str):
     """
-    Добавляет одно сообщение в историю диалога.
-    ВАЖНО: Эта функция теперь менее предпочтительна, чем update_dialog.
+    (Асинхронно) Добавляет одно сообщение в историю диалога.
     """
-    dialog = get_or_create_dialog(db, chat_id)
+    dialog = await get_or_create_dialog(db, chat_id)
     dialog.history.append({"role": role, "content": content})
     flag_modified(dialog, "history")
-    db.commit()
+    await db.commit()
     print(f"Сообщение от '{role}' сохранено в историю для chat_id: {chat_id}")
 
-def log_user_message(db: Session, chat_id: str, content: str):
-    """Логирует сообщение от пользователя в full_log."""
-    dialog = get_or_create_dialog(db, chat_id)
+
+async def log_user_message(db: AsyncSession, chat_id: str, content: str):
+    """(Асинхронно) Логирует сообщение от пользователя в full_log."""
+    dialog = await get_or_create_dialog(db, chat_id)
     log_entry = {
         "type": "user_message",
         "timestamp": datetime.now().isoformat(),
@@ -74,11 +85,12 @@ def log_user_message(db: Session, chat_id: str, content: str):
     }
     dialog.full_log.append(log_entry)
     flag_modified(dialog, "full_log")
-    db.commit()
+    await db.commit()
 
-def log_llm_response(db: Session, chat_id: str, llm_response_json: dict):
-    """Логирует полный JSON-ответ от LLM в full_log."""
-    dialog = get_or_create_dialog(db, chat_id)
+
+async def log_llm_response(db: AsyncSession, chat_id: str, llm_response_json: dict):
+    """(Асинхронно) Логирует полный JSON-ответ от LLM в full_log."""
+    dialog = await get_or_create_dialog(db, chat_id)
     log_entry = {
         "type": "llm_response",
         "timestamp": datetime.now().isoformat(),
@@ -86,24 +98,24 @@ def log_llm_response(db: Session, chat_id: str, llm_response_json: dict):
     }
     dialog.full_log.append(log_entry)
     flag_modified(dialog, "full_log")
-    db.commit()
+    await db.commit()
 
-def get_dialog_history(db: Session, chat_id: str) -> list:
+
+async def get_dialog_history(db: AsyncSession, chat_id: str) -> list:
     """
-    Получает историю диалога для указанного chat_id.
+    (Асинхронно) Получает историю диалога для указанного chat_id.
     """
-    dialog = get_or_create_dialog(db, chat_id)
+    # Эта функция вызывает другую асинхронную функцию, поэтому она тоже должна быть async
+    dialog = await get_or_create_dialog(db, chat_id)
     return dialog.history
 
-# --- Функции для работы с очередью остаются без изменений ---
-def add_pending_message(db: Session, chat_id: str, content: str, file_url: str = None, file_name: str = None):
+
+async def add_pending_message(db: AsyncSession, chat_id: str, content: str, file_url: str = None, file_name: str = None):
     """
-    Добавляет входящее сообщение в очередь ожидания.
-    Теперь также принимает информацию о файле.
+    (Асинхронно) Добавляет входящее сообщение в очередь ожидания.
     """
-    dialog = get_or_create_dialog(db, chat_id)
+    dialog = await get_or_create_dialog(db, chat_id)
     
-    # Создаем более богатый объект сообщения
     message_data = {"role": "user", "content": content}
     if file_url:
         message_data["file_url"] = file_url
@@ -111,24 +123,25 @@ def add_pending_message(db: Session, chat_id: str, content: str, file_url: str =
         message_data["file_name"] = file_name
 
     dialog.pending_messages.append(message_data)
-    dialog.pending_since = func.now() 
+    dialog.pending_since = func.now() # func.now() работает и в async
     
     flag_modified(dialog, "pending_messages")
-    db.commit()
+    await db.commit()
     print(f"Сообщение для {chat_id} добавлено в очередь.")
-    
 
-def get_and_clear_pending_dialogs(db: Session, delay_seconds: int = 10) -> list[dict]:
+
+async def get_and_clear_pending_dialogs(db: AsyncSession, delay_seconds: int = 10) -> list[dict]:
     """
-    Находит диалоги, ожидающие обработки, "забирает" их сообщения и очищает очередь.
-    Возвращает список словарей, содержащих объект диалога и его сообщения.
+    (Асинхронно) Находит диалоги, ожидающие обработки, и очищает их очередь.
     """
-    time_filter = Dialog.pending_since <= (func.now() - timedelta(seconds=delay_seconds))
+    time_filter = Dialog.pending_since <= (datetime.utcnow() - timedelta(seconds=delay_seconds))
     
-    dialogs_to_process = db.query(Dialog).filter(
+    stmt = select(Dialog).where(
         func.jsonb_array_length(Dialog.pending_messages) > 0,
         time_filter
-    ).all()
+    )
+    result = await db.execute(stmt)
+    dialogs_to_process = result.scalars().all()
 
     if not dialogs_to_process:
         return []
@@ -141,47 +154,43 @@ def get_and_clear_pending_dialogs(db: Session, delay_seconds: int = 10) -> list[
         flag_modified(dialog, "pending_messages")
         results.append({'dialog': dialog, 'pending': pending})
     
-    db.commit()
+    await db.commit()
     return results
 
-# src/database/db_service.py
 
-def get_due_reminders(db: Session) -> list[Dialog]:
-    """Находит диалоги, которые требуют напоминания прямо сейчас."""
-    # Находим диалоги, где флаг needs_reminder=True и updated_at прошло достаточно времени
-    
-    # Условие для 1-го напоминания (прошел 1 час)
-    remind_level_1 = and_(Dialog.reminder_level == 0, Dialog.updated_at < datetime.now() - timedelta(hours=1))
-    
-    # Условие для 2-го напоминания (прошло 3 часа с последнего обновления)
-    remind_level_2 = and_(Dialog.reminder_level == 1, Dialog.updated_at < datetime.now() - timedelta(hours=3))
+async def get_due_reminders(db: AsyncSession) -> list[Dialog]:
+    """(Асинхронно) Находит диалоги, которые требуют напоминания."""
+    now = datetime.now() # Получаем время один раз для консистентности
+    remind_level_1 = and_(Dialog.reminder_level == 0, Dialog.updated_at < now - timedelta(hours=1))
+    remind_level_2 = and_(Dialog.reminder_level == 1, Dialog.updated_at < now - timedelta(hours=3))
+    remind_level_3 = and_(Dialog.reminder_level == 2, Dialog.updated_at < now - timedelta(days=1))
 
-    # Условие для 3-го напоминания (прошло 24 часа)
-    remind_level_3 = and_(Dialog.reminder_level == 2, Dialog.updated_at < datetime.now() - timedelta(days=1))
-
-    dialogs_to_remind = db.query(Dialog).filter(
+    stmt = select(Dialog).where(
         Dialog.needs_reminder == True,
-        or_(remind_level_1, remind_level_2, remind_level_3) # <--- ИСПРАВЛЕНО
-    ).all()
+        or_(remind_level_1, remind_level_2, remind_level_3)
+    )
+    result = await db.execute(stmt)
+    dialogs_to_remind = result.scalars().all()
     
     return dialogs_to_remind
 
-def has_pending_messages(db: Session, chat_id: str) -> bool:
-    """Проверяет, есть ли сообщения в очереди для данного чата."""
-    count = db.query(Dialog).filter(
-    Dialog.chat_id == chat_id,
-    func.jsonb_array_length(Dialog.pending_messages) > 0
-    ).count()
+
+async def has_pending_messages(db: AsyncSession, chat_id: str) -> bool:
+    """(Асинхронно) Проверяет, есть ли сообщения в очереди для данного чата."""
+    stmt = select(func.count()).select_from(Dialog).where(
+        Dialog.chat_id == chat_id,
+        func.jsonb_array_length(Dialog.pending_messages) > 0
+    )
+    result = await db.execute(stmt)
+    count = result.scalar() or 0
     return count > 0
 
 
-
-def get_dialog_state(db: Session, chat_id: str) -> str | None:
+async def get_dialog_state(db: AsyncSession, chat_id: str) -> str | None:
     """
-    Получает текущее состояние (current_state) диалога по chat_id.
-    Возвращает строку состояния или None, если диалог не найден.
+    (Асинхронно) Получает текущее состояние диалога по chat_id.
     """
-    dialog = db.query(Dialog).filter(Dialog.chat_id == chat_id).first()
-    if dialog:
-        return dialog.current_state
-    return None
+    stmt = select(Dialog.current_state).where(Dialog.chat_id == chat_id)
+    result = await db.execute(stmt)
+    state = result.scalars().first()
+    return state

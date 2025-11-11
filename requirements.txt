@@ -19,3 +19,5 @@ sqlalchemy
 apscheduler
 tenacity
 redis
+asyncpg
+httpx
