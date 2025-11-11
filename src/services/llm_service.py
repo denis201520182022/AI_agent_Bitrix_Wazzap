@@ -110,7 +110,7 @@ async def get_bot_decision(conversation_history: list, system_prompt: str) -> di
     except OpenAIError as e: # Отдельно логгируем ошибки OpenAI
         logger.error(f"❌ Ошибка при обращении к OpenAI API после всех ретраев: %s", e)
         return {
-            "response_text": "К сожалению, произошла внутренняя техническая ошибка при обращении к ИИ. Мой коллега-менеджер скоро свяжется с вами, чтобы всё прояснить.",
+            "response_text": None,
             "new_state": "escalated",
             "action": "ESCALATE_TO_MANAGER",
             "action_params": {

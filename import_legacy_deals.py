@@ -7,20 +7,22 @@ load_dotenv()
 
 # Импортируем необходимые сервисы и модели из вашего проекта
 from src.database.db import SessionLocal, engine, Base
-from src.database.models import Dialog
+from src.database.models import Dialog 
 from src.database import db_service
 from src.services import bitrix_service
-from src.utils import normalize_phone
+from src.utils import normalize_phone 
 
 import logging
 import traceback
 
 # --- Настройка логирования для скрипта ---
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Устанавливаем базовую конфигурацию логирования, если она еще не настроена
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # --- ЗАГРУЗКА НАСТРОЕК ИЗ .ENV ---
-TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID")
+TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID") 
 
 async def import_legacy_deals():
     logger.info("🚀 Запуск скрипта импорта существующих сделок...")
@@ -33,34 +35,40 @@ async def import_legacy_deals():
     
     # Статистика импорта
     stats = {
-        'total': 0,
+        'total_deals_fetched': 0,
+        'processed_deals': 0,
         'success': 0,
-        'skipped_no_contact': 0,
         'skipped_no_manager': 0,
         'skipped_no_phone': 0,
-        'skipped_contact_not_found': 0,
-        'errors': 0
+        'skipped_bitrix_api_error': 0,
+        'skipped_by_title_filter': 0, # <-- Добавил новый счетчик для статистики
+        'errors_db': 0
     }
     
     try:
-        # Получаем все сделки из Bitrix24
-        all_deals_in_target_funnel = []
+        # Получаем все сделки из Bitrix24.
+        all_deals_simple_data = []
         start = 0
         
         while True:
             logger.info(f"Запрашиваю сделки из Bitrix24, начиная с элемента {start}...")
             
             try:
+                # --- ИЗМЕНЕНИЕ 1: Добавлено "TITLE" в 'select' ---
                 bitrix_deals_response = bitrix_service._make_bitrix_request(
                     "crm.deal.list.json",
                     params={
-                        'filter': {"CATEGORY_ID": TARGET_FUNNEL_ID},
-                        'select': ["ID", "ASSIGNED_BY_ID", "CONTACT_ID", "STAGE_ID"],
+                        'filter': {
+                            "CATEGORY_ID": TARGET_FUNNEL_ID,
+                            "!=STAGE_ID": "C11:UC_O7UAOV"
+                        },
+                        'select': ["ID", "ASSIGNED_BY_ID", "CONTACT_ID", "TITLE"], # <-- "TITLE" добавлен здесь
                         'start': start
                     }
                 )
             except Exception as e:
-                logger.error(f"❌ Ошибка при запросе сделок (start={start}): {e}")
+                logger.error(f"❌ Ошибка при запросе списка сделок из Bitrix24 (start={start}): {e}")
+                stats['skipped_bitrix_api_error'] += 1
                 break
 
             if not bitrix_deals_response or 'result' not in bitrix_deals_response:
@@ -72,104 +80,126 @@ async def import_legacy_deals():
                 logger.info("Дополнительных сделок не найдено. Завершаю.")
                 break
 
-            all_deals_in_target_funnel.extend(deals_batch)
+            all_deals_simple_data.extend(deals_batch)
             start += len(deals_batch)
             
-            if len(deals_batch) < 50:
+            if len(deals_batch) < 50: 
                 break
             
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5) 
 
-        stats['total'] = len(all_deals_in_target_funnel)
-        logger.info(f"Найдено {stats['total']} сделок в целевой воронке ID: {TARGET_FUNNEL_ID}.")
+        stats['total_deals_fetched'] = len(all_deals_simple_data)
+        logger.info(f"Найдено {stats['total_deals_fetched']} сделок в целевой воронке ID: {TARGET_FUNNEL_ID}.")
 
         # Обрабатываем каждую сделку
-        for idx, deal_data in enumerate(all_deals_in_target_funnel, 1):
-            try:
-                deal_id = int(deal_data["ID"])
-                manager_id = int(deal_data["ASSIGNED_BY_ID"]) if deal_data.get("ASSIGNED_BY_ID") else None
-                contact_id = int(deal_data["CONTACT_ID"]) if deal_data.get("CONTACT_ID") else None
-                current_stage = deal_data["STAGE_ID"]
+        for idx, deal_simple_data in enumerate(all_deals_simple_data, 1):
+            deal_id_for_log = deal_simple_data.get("ID", "N/A")
 
-                # Проверяем наличие контакта
-                if not contact_id:
-                    logger.warning(f"⚠️ [{idx}/{stats['total']}] Пропускаю сделку {deal_id}: Отсутствует CONTACT_ID.")
-                    stats['skipped_no_contact'] += 1
+            # --- ИЗМЕНЕНИЕ 2: Фильтрация по названию сделки ---
+            deal_title = deal_simple_data.get("TITLE", "")
+            if deal_title.endswith("(Привлечен доп должник)"):
+                logger.info(f"  - Пропускаю сделку {deal_id_for_log} с названием '{deal_title}', т.к. это доп. должник.")
+                stats['skipped_by_title_filter'] += 1
+                continue # Переходим к следующей сделке
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+            stats['processed_deals'] += 1
+            deal_id = int(deal_simple_data["ID"])
+
+            try:
+                deal_full_details = bitrix_service.get_deal_details_2(deal_id)
+                if not deal_full_details:
+                    logger.warning(f"⚠️ [{idx}/{stats['total_deals_fetched']}] Пропускаю сделку {deal_id}: Не удалось получить полные детали сделки из Bitrix24.")
+                    stats['skipped_bitrix_api_error'] += 1
                     continue
-                
-                # Проверяем наличие менеджера
+
+                manager_id = int(deal_full_details.get("ASSIGNED_BY_ID")) if deal_full_details.get("ASSIGNED_BY_ID") else None
+                contact_id = int(deal_full_details.get("CONTACT_ID")) if deal_full_details.get("CONTACT_ID") else None
+                company_id = int(deal_full_details.get("COMPANY_ID")) if deal_full_details.get("COMPANY_ID") else None
+
                 if not manager_id:
-                    logger.warning(f"⚠️ [{idx}/{stats['total']}] Пропускаю сделку {deal_id}: Отсутствует ASSIGNED_BY_ID (менеджер).")
+                    logger.warning(f"⚠️ [{idx}/{stats['total_deals_fetched']}] Пропускаю сделку {deal_id}: Отсутствует ASSIGNED_BY_ID (менеджер).")
                     stats['skipped_no_manager'] += 1
                     continue
 
-                # Пытаемся получить детали контакта
-                try:
+                client_phone = None
+                client_name = "Уважаемый клиент"
+                phone_source = "Не найден"
+
+                if contact_id:
                     contact_details = bitrix_service.get_contact_details_2(contact_id)
-                except Exception as contact_error:
-                    logger.warning(f"⚠️ [{idx}/{stats['total']}] Пропускаю сделку {deal_id}: Контакт {contact_id} не найден или ошибка API ({contact_error})")
-                    stats['skipped_contact_not_found'] += 1
-                    continue
+                    if contact_details and contact_details.get("PHONE"):
+                        phone_data = contact_details["PHONE"][0]
+                        if phone_data and phone_data.get("VALUE"):
+                            client_phone = normalize_phone(phone_data["VALUE"])
+                            client_name = contact_details.get("NAME", client_name)
+                            phone_source = f"Контакт {contact_id}"
+                            logger.debug(f"  - [{idx}/{stats['total_deals_fetched']}] Телефон найден у контакта {contact_id} для сделки {deal_id}.")
 
-                # Проверяем наличие телефона
-                if not (contact_details and contact_details.get("PHONE")):
-                    logger.warning(f"⚠️ [{idx}/{stats['total']}] Пропускаю сделку {deal_id}: У контакта {contact_id} нет номера телефона.")
+                if not client_phone and company_id:
+                    company_details = bitrix_service.get_company_details(company_id)
+                    if company_details and company_details.get("PHONE"):
+                        company_phones = company_details["PHONE"]
+                        chosen_phone_data = None
+
+                        for phone_entry in company_phones:
+                            if phone_entry.get("VALUE_TYPE") == "WORK":
+                                chosen_phone_data = phone_entry
+                                break
+
+                        if not chosen_phone_data and company_phones:
+                            chosen_phone_data = company_phones[0]
+                        
+                        if chosen_phone_data and chosen_phone_data.get("VALUE"):
+                            client_phone = normalize_phone(chosen_phone_data["VALUE"])
+                            client_name = company_details.get("TITLE", client_name) 
+                            phone_source = f"Компания {company_id}"
+                            logger.debug(f"  - [{idx}/{stats['total_deals_fetched']}] Телефон найден у компании {company_id} (источник: {phone_source}) для сделки {deal_id}.")
+                                
+                if not client_phone:
+                    logger.warning(f"⚠️ [{idx}/{stats['total_deals_fetched']}] Пропускаю сделку {deal_id}: Не удалось найти номер телефона ни у контакта ({contact_id}), ни у компании ({company_id}).")
                     stats['skipped_no_phone'] += 1
                     continue
 
-                # Нормализуем телефон
                 try:
-                    client_phone = normalize_phone(contact_details["PHONE"][0].get("VALUE"))
-                except Exception as phone_error:
-                    logger.warning(f"⚠️ [{idx}/{stats['total']}] Пропускаю сделку {deal_id}: Ошибка нормализации телефона ({phone_error})")
-                    stats['skipped_no_phone'] += 1
-                    continue
-
-                # Создаем/обновляем диалог
-                try:
-                    dialog = db_service.get_or_create_dialog(
-                        db, client_phone, deal_id, manager_id, TARGET_FUNNEL_ID
-                    )
-                    
-                    # Устанавливаем состояние 'idle' и сбрасываем напоминания
-                    db_service.update_dialog(
-                        db, client_phone, 'idle', [], needs_reminder=False
-                    )
-                    
+                    dialog = db_service.get_or_create_dialog(db, client_phone, deal_id, manager_id, TARGET_FUNNEL_ID)
+                    db_service.update_dialog(db, client_phone, 'idle', [], needs_reminder=False)
                     stats['success'] += 1
                     
-                    if idx % 50 == 0:  # Прогресс каждые 50 сделок
-                        logger.info(f"  📊 Прогресс: {idx}/{stats['total']} ({stats['success']} успешно импортировано)")
+                    if idx % 50 == 0 or idx == stats['total_deals_fetched']:  
+                        logger.info(f"  📊 Прогресс: {idx}/{stats['total_deals_fetched']} (Успешно: {stats['success']}). Последняя сделка {deal_id}.")
                     else:
-                        logger.debug(f"  - [{idx}/{stats['total']}] Сделка {deal_id} (клиент: {client_phone}) обработана.")
+                        logger.debug(f"  - [{idx}/{stats['total_deals_fetched']}] Сделка {deal_id} (клиент: {client_name}, телефон: {client_phone}, источник: {phone_source}) обработана.")
                         
                 except Exception as db_error:
-                    logger.error(f"❌ [{idx}/{stats['total']}] Ошибка БД для сделки {deal_id}: {db_error}")
-                    stats['errors'] += 1
+                    logger.error(f"❌ [{idx}/{stats['total_deals_fetched']}] Ошибка БД при создании/обновлении диалога для сделки {deal_id}: {db_error}")
+                    logger.error(traceback.format_exc())
+                    stats['errors_db'] += 1
+                    db.rollback()
                     continue
 
             except Exception as e:
-                logger.error(f"❌ [{idx}/{stats['total']}] Необработанная ошибка при обработке сделки: {e}")
+                logger.error(f"❌ [{idx}/{stats['total_deals_fetched']}] Необработанная ошибка при обработке сделки {deal_id}: {e}")
                 logger.error(traceback.format_exc())
-                stats['errors'] += 1
+                stats['errors_db'] += 1
                 continue
 
     except Exception as e:
-        logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА во время импорта сделок: {e}")
+        logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА верхнего уровня во время импорта сделок: {e}")
         logger.critical(traceback.format_exc())
     finally:
         db.close()
         
-        # Выводим финальную статистику
         logger.info("=" * 60)
         logger.info("📊 СТАТИСТИКА ИМПОРТА:")
-        logger.info(f"  Всего сделок найдено: {stats['total']}")
-        logger.info(f"  ✅ Успешно импортировано: {stats['success']}")
-        logger.info(f"  ⚠️ Пропущено (нет CONTACT_ID): {stats['skipped_no_contact']}")
+        logger.info(f"  Всего сделок найдено в Битрикс: {stats['total_deals_fetched']}")
+        logger.info(f"  Попыток обработки сделок: {stats['processed_deals']}")
+        logger.info(f"  ✅ Успешно импортировано диалогов: {stats['success']}")
         logger.info(f"  ⚠️ Пропущено (нет менеджера): {stats['skipped_no_manager']}")
-        logger.info(f"  ⚠️ Пропущено (контакт не найден): {stats['skipped_contact_not_found']}")
-        logger.info(f"  ⚠️ Пропущено (нет телефона): {stats['skipped_no_phone']}")
-        logger.info(f"  ❌ Ошибок при импорте: {stats['errors']}")
+        logger.info(f"  ⚠️ Пропущено (нет телефона у контакта/компании): {stats['skipped_no_phone']}")
+        logger.info(f"  ⚠️ Пропущено по фильтру названия: {stats['skipped_by_title_filter']}") # <-- Добавил вывод в статистику
+        logger.info(f"  ❌ Ошибки Bitrix API: {stats['skipped_bitrix_api_error']}")
+        logger.info(f"  ❌ Ошибки БД (не удалось создать/обновить диалог): {stats['errors_db']}")
         logger.info("=" * 60)
         logger.info("✅ Скрипт импорта завершен.")
 

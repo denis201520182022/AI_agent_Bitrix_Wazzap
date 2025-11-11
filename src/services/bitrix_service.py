@@ -272,7 +272,41 @@ def escalate_deal_to_manager(deal_id: int, manager_id: int, reason: str):
     logger.info(f"--- ПРОЦЕДУРА ЭСКАЛАЦИИ ЗАВЕРШЕНА для сделки {deal_id} ---")
 
 
+def get_deal_details_2(deal_id: int) -> dict | None:
+    """
+    Получает детальную информацию о сделке по ее ID.
+    """
+    logger.info(f"Запрос деталей сделки {deal_id}.")
+    data = _make_bitrix_request(
+        "crm.deal.get.json",
+        params={'id': deal_id, 'select': ["ID", "TITLE", "STAGE_ID", "CONTACT_ID", "COMPANY_ID", "ASSIGNED_BY_ID"]} # Добавляем COMPANY_ID и другие важные поля
+    )
+    if data and 'result' in data:
+        logger.info(f"✅ Детали сделки {deal_id} получены.")
+        return data['result']
+    else:
+        logger.warning(f"⚠️ Не удалось получить детали сделки {deal_id}. Ответ API: %s", data)
+        return None
 
+def get_company_details(company_id: int) -> dict | None:
+    """
+    Получает детальную информацию о компании по ее ID.
+    Целенаправленно запрашивает имя и телефон.
+    """
+    logger.info(f"Запрос деталей компании {company_id}.")
+    data = _make_bitrix_request(
+        "crm.company.get.json",
+        params={
+            'id': company_id,
+            'select': ["TITLE", "PHONE"] # В Bitrix24 имя компании это "TITLE"
+        }
+    )
+    if not data or 'result' not in data or data['result'] is None:
+        logger.warning(f"⚠️ Не удалось получить детали компании {company_id}. Ответ API: %s", data)
+        return None
+    
+    logger.info(f"✅ Детали компании {company_id} получены.")
+    return data.get('result')
 
 
 def get_contact_details_2(contact_id: int) -> dict | None:

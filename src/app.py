@@ -7,11 +7,11 @@ import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
-
+import aioconsole
 from fastapi import FastAPI, Request, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-
+from datetime import datetime, timedelta # !!! ДОБАВИТЬ ЭТУ СТРОКУ
 from database import db_service
 from database.db import SessionLocal
 from services import bitrix_service, wazzup_service, llm_service, prompt_service
@@ -53,6 +53,170 @@ async def get_redis_client():
     )
 # --- КОНЕЦ БЛОКА Redis Configuration ---
 
+
+# --- КНИГА РЕЦЕПТОВ ДЛЯ ПРОМПТОВ ---
+# Базовые блоки, которые нужны при обработке любого ответа клиента
+BASE_PROMPTS = [
+    "#start#",
+    "#style#",
+    "#BASE#",
+    "#BASE_KNOW#" # Главный блок с логикой мышления
+]
+
+# Карта: состояние диалога -> [список специальных блоков для этого состояния]
+PROMPT_RECIPES = {
+    # Сценарий 1: Приветствие
+    "d1_awaiting_greeting_response": ["#Dialog1#"],
+    "d1_awaiting_debtor_clarification": ["#Dialog1#"],
+    "d1_awaiting_debtor_details": ["#Dialog1#"],
+
+    # Сценарий 2: Новый лот
+    "d2_awaiting_lot_response": ["#Dialog2#"],
+
+    # Сценарий 3: Касание
+    "d3_awaiting_touch_response": ["#Dialog3#"],
+    "d3_awaiting_details_after_touch": ["#Dialog3#"],
+
+    # Состояние по умолчанию (если состояние не найдено в рецептах)
+    # Можно оставить пустым, чтобы использовались только базовые промпты, или добавить общий блок.
+    "default": [] 
+}
+# --- КОНЕЦ КНИГИ РЕЦЕПТОВ ---
+
+# --- НОВЫЙ ВОРКЕР ДЛЯ ВВОДА ИЗ КОНСОЛИ ---
+async def console_input_worker():
+    logger.info("👨‍💻 Воркер консольного ввода запущен. Введите 'exit' для выхода.")
+    
+    # Задаем номер телефона для теста один раз
+    chat_id = await aioconsole.ainput("Введите номер телефона (chat_id) для этого сеанса тестирования: ")
+    if not chat_id:
+        chat_id = "79991234567" # Номер по умолчанию
+    logger.info(f"Тестирование диалога для: {chat_id}. Теперь можете отправлять сообщения.")
+
+    while True:
+        db = None
+        try:
+            message_text = await aioconsole.ainput(f"[{chat_id}] > ")
+
+            if message_text.lower() == 'exit':
+                break
+            if not message_text:
+                continue
+
+            db = SessionLocal()
+            db_service.add_pending_message(db, chat_id, message_text)
+            logger.info(f">>> Сообщение от [КОНСОЛЬ/{chat_id}] добавлено в очередь.")
+
+        except Exception as e:
+            logger.error(f"Ошибка в воркере консольного ввода: {e}")
+        finally:
+            if db:
+                db.close()
+
+
+# --- Новый воркер для ежемесячной проверки неактивных диалогов ---
+async def monthly_check_worker():
+    """
+    Этот воркер проверяет диалоги, которые не обновлялись более месяца,
+    и перемещает соответствующие сделки в Bitrix24 на стадию 'Касание сегодня'.
+    """
+    logger.info("🗓️ Воркер ежемесячной проверки запущен!")
+    db = None
+    
+    # Получаем ID стадии из .env
+    escalation_stage_id = os.getenv("TOUCH_TODAY_STAGE_ID")
+    if not escalation_stage_id:
+        logger.critical("❌ ОСТАНОВКА ВОРКЕРА ЕЖЕМЕСЯЧНОЙ ПРОВЕРКИ: Переменная TOUCH_TODAY_STAGE_ID не задана в .env.")
+        return
+
+    try:
+        db = SessionLocal()
+        one_month_ago = datetime.now() - timedelta(days=30) # Определяем период "месяц назад"
+
+        # Находим диалоги, которые не обновлялись более месяца, имеют deal_id и manager_id
+        inactive_dialogs = db.query(db_service.Dialog).filter(
+            db_service.Dialog.updated_at < one_month_ago,
+            db_service.Dialog.deal_id.isnot(None),
+            db_service.Dialog.manager_id.isnot(None)
+        ).all()
+
+        if not inactive_dialogs:
+            logger.info("  - Нет диалогов, неактивных более месяца.")
+            return
+
+        logger.info(f"  - Найдено {len(inactive_dialogs)} диалогов, неактивных более месяца, для обработки.")
+
+        for dialog in inactive_dialogs:
+            try:
+                deal_id = dialog.deal_id
+                manager_id = dialog.manager_id
+                chat_id = dialog.chat_id
+
+                logger.info(f"    - Обработка неактивного диалога {chat_id} (сделка {deal_id}).")
+
+                # Проверяем текущее состояние сделки, чтобы не перемещать сделки, которые уже закрыты
+                deal_details = bitrix_service.get_deal_details_2(deal_id)
+                if not deal_details:
+                    logger.warning(f"      - Пропускаю сделку {deal_id}: не удалось получить детали сделки из Bitrix24.")
+                    continue
+
+                current_stage = deal_details.get("STAGE_ID")
+                # Здесь можно добавить более сложную логику, если есть стадии, на которые переводить нельзя (например, "Сделка закрыта успешно" или "Сделка провалена")
+                # Для примера, просто перемещаем
+                
+                # 1. Перемещение сделки на стадию "Касание сегодня"
+                move_success = bitrix_service.move_deal_to_stage(deal_id, escalation_stage_id)
+                if move_success:
+                    logger.info(f"      - ✅ Сделка {deal_id} успешно перемещена на стадию '{escalation_stage_id}'.")
+                    
+                    # 2. Добавление комментария в таймлайн сделки
+                    comment_text = (f"[Чат-бот]: Автоматический перевод сделки на стадию "
+                                    f"'Касание сегодня' (из-за отсутствия активности более месяца) "
+                                    f"по диалогу {chat_id}.")
+                    bitrix_service.add_comment_to_deal(deal_id, comment_text)
+                    logger.info(f"      - ✅ Комментарий добавлен в сделку {deal_id}.")
+
+                    # Опционально: можно обновить состояние диалога в БД или его updated_at,
+                    # чтобы принудительно сбросить счетчик неактивности.
+                    # Однако, Bitrix24 webhook на ONCRMDEALUPDATE должен сам обновить диалог.
+                    # Можно просто установить needs_reminder=False и reminder_level=0.
+                    dialog.needs_reminder = False
+                    dialog.reminder_level = 0
+                    dialog.current_state = 'awaiting_touch_today_response' # Или другое подходящее состояние
+                    db.add(dialog) # Убедиться, что изменения добавлены в сессию
+                    db.commit()
+                    logger.info(f"      - Диалог {chat_id} обновлен в БД.")
+
+                else:
+                    logger.error(f"      - ❌ Не удалось переместить сделку {deal_id} на стадию '{escalation_stage_id}'.")
+                    bitrix_service.add_comment_to_deal(
+                        deal_id,
+                        f"[Чат-бот] Ошибка: Не удалось автоматически перевести сделку на стадию 'Касание сегодня' "
+                        f"(из-за неактивности более месяца) по диалогу {chat_id}."
+                    )
+
+            except SQLAlchemyError as e:
+                logger.error(f"❌ ОШИБКА БАЗЫ ДАННЫХ при обработке диалога {dialog.chat_id} в воркере ежемесячной проверки: %s", e)
+                logger.error(traceback.format_exc())
+                if db:
+                    db.rollback()
+            except Exception as e:
+                logger.error(f"❌ НЕИЗВЕСТНАЯ ОШИБКА при обработке диалога {dialog.chat_id} в воркере ежемесячной проверки: %s", e)
+                logger.error(traceback.format_exc())
+
+    except SQLAlchemyError as e:
+        logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА БАЗЫ ДАННЫХ В ВОРКЕРЕ ЕЖЕМЕСЯЧНОЙ ПРОВЕРКИ: %s", e)
+        logger.critical(traceback.format_exc())
+        if db:
+            db.rollback()
+    except Exception as e:
+        logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ НЕИЗВЕСТНАЯ ОШИБКА В ВОРКЕРЕ ЕЖЕМЕСЯЧНОЙ ПРОВЕРКИ: %s", e)
+        logger.critical(traceback.format_exc())
+    finally:
+        if db:
+            db.close()
+    logger.info("✅ Воркер ежемесячной проверки завершен.")
+
 async def process_pending_messages_worker():
     logger.info("🚀 Воркер-ДИСПЕТЧЕР запущен!")
     while True:
@@ -77,15 +241,33 @@ async def process_pending_messages_worker():
 
                 # --- 2. ПОЛУЧЕНИЕ РЕШЕНИЯ ОТ LLM ---
                 prompt_library = prompt_service.get_prompt_library()
-                all_prompts_text = "\n\n".join(prompt_library.values())
-                
                 current_dialog_state = db_service.get_dialog_state(db, dialog.chat_id)
-                # Использование состояния для приставки к системному промпту (пример)
+
+                # --- НАЧАЛО ИЗМЕНЕНИЙ: Динамическая сборка промпта ---
+
+                # 1. Получаем специальные блоки для текущего состояния из "книги рецептов"
+                # Используем .get(), чтобы избежать ошибки, если состояние не найдено. 
+                # Если состояние не найдено, берем рецепт для "default".
+                specific_keys = PROMPT_RECIPES.get(current_dialog_state, PROMPT_RECIPES.get("default", []))
+                
+                # 2. Объединяем базовые и специальные блоки
+                required_keys = BASE_PROMPTS + specific_keys
+                logger.info(f"  - Для состояния '{current_dialog_state}' собираем промпт из блоков: {required_keys}")
+                
+                # 3. Собираем текст промпта только из нужных блоков
+                prompt_parts = [prompt_library.get(key, "") for key in required_keys]
+                all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+
+                # 4. Добавляем в конец системного промпта явное указание на текущее состояние
                 system_prompt_addition = ""
                 if current_dialog_state:
-                    system_prompt_addition = f"Текущее состояние диалога: {current_dialog_state}. "
-                all_prompts_text = all_prompts_text + "\n\n" + system_prompt_addition
-                llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
+                    system_prompt_addition = f"\n\nТекущее состояние диалога: {current_dialog_state}. Действуй строго в соответствии с этим состоянием."
+                
+                final_system_prompt = all_prompts_text + system_prompt_addition
+                
+                # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+                llm_decision = await llm_service.get_bot_decision(current_history, final_system_prompt)
                 if llm_decision:
                     db_service.log_llm_response(db, dialog.chat_id, llm_decision)
 
@@ -151,9 +333,12 @@ async def process_pending_messages_worker():
 
                 # --- 4. ОБНОВЛЕНИЕ ДИАЛОГА В БД ---
                 states_that_need_reminders = [
-                    "awaiting_initial_response", "awaiting_debtor_clarification", 
-                    "awaiting_debtor_details", "awaiting_new_lot_response",
-                    "awaiting_touch_today_response"
+                    "d1_awaiting_greeting_response",
+                    "d1_awaiting_debtor_clarification",
+                    "d1_awaiting_debtor_details",
+                    "d2_awaiting_lot_response",
+                    "d3_awaiting_touch_response",
+                    "d3_awaiting_details_after_touch"
                 ]
                 should_remind = new_state in states_that_need_reminders
 
@@ -189,21 +374,35 @@ async def reminder_worker():
         
         for dialog in dialogs_to_remind:
             try:
-                deal_details = bitrix_service.get_deal_details(dialog.deal_id)
+                
+                # !!! ОБНОВЛЕНИЕ: Воркер напоминаний
+                # Сначала получаем deal_details_2 для доступа к COMPANY_ID
+                deal_details = bitrix_service.get_deal_details_2(dialog.deal_id) # Используем get_deal_details_2
                 if not deal_details:
                     logger.warning(f"  - Пропускаю напоминание для {dialog.chat_id}: не удалось получить детали сделки {dialog.deal_id}.")
                     continue
-
-                contact_id = deal_details.get("CONTACT_ID")
+                
+                contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
+                company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None # !!! ДОБАВЛЕНО
                 client_name = "Уважаемый клиент"
-                if contact_id:
-                    contact_details = bitrix_service.get_contact_details(int(contact_id))
+
+                # 1. Попытка получить имя клиента из связанной компании (приоритет)
+                if company_id:
+                    company_details = bitrix_service.get_company_details(company_id)
+                    if company_details:
+                        client_name = company_details.get("TITLE", client_name)
+                        logger.debug(f"  - Имя клиента для напоминания взято из компании {company_id}.")
+                
+                # 2. Если имя все еще дефолтное, пытаемся получить из связанного контакта
+                if client_name == "Уважаемый клиент" and contact_id:
+                    contact_details = bitrix_service.get_contact_details_2(contact_id) # Используем get_contact_details_2
                     if contact_details:
                         client_name = contact_details.get("NAME", client_name)
-                    else:
-                        logger.warning(f"  - Не удалось получить детали контакта {contact_id} для диалога {dialog.chat_id}.")
-                else:
-                    logger.warning(f"  - Отсутствует CONTACT_ID для сделки {dialog.deal_id} в диалоге {dialog.chat_id}.")
+                        logger.debug(f"  - Имя клиента для напоминания взято из контакта {contact_id}.")
+                
+                if client_name == "Уважаемый клиент":
+                    logger.warning(f"  - Не удалось получить имя клиента для диалога {dialog.chat_id}: нет имени у компании ({company_id}) или контакта ({contact_id}).")
+
 
                 reminder_level = dialog.reminder_level
                 instruction = None
@@ -228,7 +427,18 @@ async def reminder_worker():
                 
                 if instruction:
                     prompt_library = prompt_service.get_prompt_library()
-                    all_prompts_text = "\n\n".join(prompt_library.values())
+
+                    # --- НАЧАЛО ИЗМЕНЕНИЙ ---
+                    # Укажите ключи, нужные для сценария "Новый лот"
+                    required_keys = [
+                        "#start#", 
+                        "#style#",
+                        "#Reminder#" # Специальный блок для этого сценария
+                    ]
+                    
+                    prompt_parts = [prompt_library.get(key, "") for key in required_keys]
+                    all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+                    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
                     
                     llm_decision = await llm_service.get_bot_decision(
                         [{"role": "system", "content": instruction}], 
@@ -309,29 +519,42 @@ async def reminder_worker():
 async def lifespan(app: FastAPI):
     logger.info("Приложение запускается...")
     
-    jobstores = {
-        'default': SQLAlchemyJobStore(url=os.getenv("DATABASE_URL"))
-    }
+    # --- Планировщик APScheduler (без изменений) ---
+    jobstores = {'default': SQLAlchemyJobStore(url=os.getenv("DATABASE_URL"))}
     scheduler = AsyncIOScheduler(jobstores=jobstores)
-    scheduler.add_job(reminder_worker, 'interval', minutes=1, id='reminder_job', replace_existing=True, misfire_grace_time=300)
+    scheduler.add_job(reminder_worker, 'interval', minutes=1, id='reminder_job', replace_existing=True)
+    scheduler.add_job(monthly_check_worker, 'cron', hour=12, minute=0, id='monthly_check_job', replace_existing=True)
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен.")
     
-    worker_task = asyncio.create_task(process_pending_messages_worker())
-    logger.info("✅ Воркер process_pending_messages_worker запущен.")
+    # --- НАЧАЛО ИЗМЕНЕНИЙ: Запуск воркеров ---
+    worker_tasks = []
     
+    # 1. Запускаем основной воркер сообщений всегда
+    task = asyncio.create_task(process_pending_messages_worker())
+    worker_tasks.append(task)
+    logger.info("✅ Воркер process_pending_messages_worker запущен.")
+
+    # 2. Запускаем консольный воркер ТОЛЬКО в режиме отладки
+    if os.getenv("DEBUG_CONSOLE_MODE") == "true":
+        task = asyncio.create_task(console_input_worker())
+        worker_tasks.append(task)
+        logger.warning("✅ ВНИМАНИЕ: Запущен режим отладки в консоли!")
+
     yield
     
     logger.info("Приложение останавливается...")
     scheduler.shutdown()
     logger.info("Планировщик APScheduler остановлен.")
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        logger.info("Воркер process_pending_messages_worker успешно остановлен.")
-    except Exception as e:
-        logger.error(f"Ошибка при остановке process_pending_messages_worker: %s", e)
+
+    # Останавливаем все запущенные воркеры
+    for task in worker_tasks:
+        task.cancel()
+    
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+    logger.info("Все воркеры успешно остановлены.")
+    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+    
     logger.info("Приложение остановлено.")
 
 app = FastAPI(title="Bitrix Wazzup Bot", lifespan=lifespan)
@@ -375,7 +598,7 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
         # Получаем клиент Redis один раз на вызов вебхука # ДОБАВИТЬ ЭТУ СТРОКУ
         r = await get_redis_client()
         #________________________________________________________________________-
-        deal_details = bitrix_service.get_deal_details(deal_id)
+        deal_details = bitrix_service.get_deal_details_2(deal_id)
         if not deal_details:
             logger.error(f"❌ Ошибка: Не удалось получить детали сделки {deal_id} из Bitrix24. Пропускаю обработку.")
             return {"status": "error", "message": "Failed to get deal details"}
@@ -411,26 +634,45 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
 
 
             contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
+            company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None # !!! ДОБАВЛЕНО
             manager_id = int(deal_details.get("ASSIGNED_BY_ID")) if deal_details.get("ASSIGNED_BY_ID") else None
             
-            if not contact_id:
-                logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 1 для сделки {deal_id}: Отсутствует CONTACT_ID.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Приветствие', отсутствует ID контакта.")
-                return {"status": "error", "message": "No contact ID"}
-
             if not manager_id:
                 logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 1 для сделки {deal_id}: Отсутствует ASSIGNED_BY_ID (менеджер).")
                 bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Приветствие', отсутствует ID менеджера.")
                 return {"status": "error", "message": "No manager ID"}
 
-            contact_details = bitrix_service.get_contact_details(contact_id)
-            if not (contact_details and contact_details.get("PHONE")):
-                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 1 для сделки {deal_id}: У контакта {contact_id} нет номера телефона.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: У контакта нет номера телефона для отправки сообщения в сценарии 'Приветствие'.")
-                return {"status": "ok", "message": "Contact has no phone number"}
+            client_phone = None
+            client_name = "Уважаемый клиент"
+            phone_source = "Не найден"
+
+            # 1. Попытка получить телефон из связанной компании (приоритет)
+            if company_id:
+                company_details = bitrix_service.get_company_details(company_id)
+                if company_details and company_details.get("PHONE"):
+                    phone_data = company_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = company_details.get("TITLE", client_name) 
+                        phone_source = f"Компания {company_id}"
+                        logger.debug(f"  - Телефон найден у компании {company_id} для сделки {deal_id} (Сценарий 1).")
+
+            # 2. Если у компании нет телефона, пытаемся получить из связанного контакта
+            if not client_phone and contact_id:
+                contact_details = bitrix_service.get_contact_details_2(contact_id) # Используем get_contact_details_2
+                if contact_details and contact_details.get("PHONE"):
+                    phone_data = contact_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = contact_details.get("NAME", client_name)
+                        phone_source = f"Контакт {contact_id}"
+                        logger.debug(f"  - Телефон найден у контакта {contact_id} для сделки {deal_id} (Сценарий 1).")
             
-            client_name = contact_details.get("NAME", "Уважаемый клиент")
-            client_phone = normalize_phone(contact_details["PHONE"][0].get("VALUE"))
+            if not client_phone:
+                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 1 для сделки {deal_id}: Не удалось найти номер телефона ни у компании ({company_id}), ни у контакта ({contact_id}).")
+                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Приветствие', не найден номер телефона клиента.")
+                return {"status": "ok", "message": "No client phone number found for scenario 1"}
+            
             
             manager = bitrix_service.get_user_details(manager_id)
             manager_name = f"{manager.get('NAME', '')} {manager.get('LAST_NAME', '')}".strip() if manager else "Ваш менеджер"
@@ -438,13 +680,30 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
             logger.info(f"  - Клиент: {client_name} ({client_phone})")
             logger.info(f"  - Менеджер: {manager_name} ({manager_id})")
 
+            
+            # 1. Получаем историю
+            current_history = db_service.get_dialog_history(db, client_phone)
+            logger.info(f"  - Найдено {len(current_history)} сообщений в истории для {client_phone}.")
+
+            # 2. Создаем команду для сценария "Приветствие"
             initial_instruction = {
                 "role": "system",
                 "content": f"initiate_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}."
             }
+            current_history.append(initial_instruction)
+
+            # 3. Собираем промпт для этого сценария
             prompt_library = prompt_service.get_prompt_library()
-            all_prompts_text = "\n\n".join(prompt_library.values())
-            llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
+            required_keys = [
+                "#start#", 
+                "#style#",
+                "#Dialog1#" # Специальный блок для приветствия
+            ]
+            prompt_parts = [prompt_library.get(key, "") for key in required_keys]
+            all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+            llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
             if llm_decision:
                 db_service.log_llm_response(db, client_phone, llm_decision)
             if not llm_decision:
@@ -492,10 +751,13 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
                 current_history.append({"role": "assistant", "content": response_text})
             
             states_that_need_reminders = [
-                "awaiting_initial_response", "awaiting_debtor_clarification", 
-                "awaiting_debtor_details", "awaiting_new_lot_response",
-                "awaiting_touch_today_response"
-            ]
+                    "d1_awaiting_greeting_response",
+                    "d1_awaiting_debtor_clarification",
+                    "d1_awaiting_debtor_details",
+                    "d2_awaiting_lot_response",
+                    "d3_awaiting_touch_response",
+                    "d3_awaiting_details_after_touch"
+                ]
             should_remind = new_state in states_that_need_reminders
 
             db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)
@@ -527,27 +789,47 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
 
 
             contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
+            company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None # !!! ДОБАВЛЕНО
             manager_id = int(deal_details.get("ASSIGNED_BY_ID")) if deal_details.get("ASSIGNED_BY_ID") else None
-
-            if not contact_id:
-                logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 2 для сделки {deal_id}: Отсутствует CONTACT_ID.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Новый лот', отсутствует ID контакта.")
-                return {"status": "error", "message": "No contact ID"}
 
             if not manager_id:
                 logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 2 для сделки {deal_id}: Отсутствует ASSIGNED_BY_ID (менеджер).")
                 bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Новый лот', отсутствует ID менеджера.")
                 return {"status": "error", "message": "No manager ID"}
 
-            contact_details = bitrix_service.get_contact_details(contact_id)
+            client_phone = None
+            client_name = "Уважаемый клиент"
+            phone_source = "Не найден"
+
+            # 1. Попытка получить телефон из связанной компании (приоритет)
+            if company_id:
+                company_details = bitrix_service.get_company_details(company_id)
+                if company_details and company_details.get("PHONE"):
+                    phone_data = company_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = company_details.get("TITLE", client_name) 
+                        phone_source = f"Компания {company_id}"
+                        logger.debug(f"  - Телефон найден у компании {company_id} для сделки {deal_id} (Сценарий 2).")
+
+            # 2. Если у компании нет телефона, пытаемся получить из связанного контакта
+            if not client_phone and contact_id:
+                contact_details = bitrix_service.get_contact_details_2(contact_id) # Используем get_contact_details_2
+                if contact_details and contact_details.get("PHONE"):
+                    phone_data = contact_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = contact_details.get("NAME", client_name)
+                        phone_source = f"Контакт {contact_id}"
+                        logger.debug(f"  - Телефон найден у контакта {contact_id} для сделки {deal_id} (Сценарий 2).")
             
-            if not (contact_details and contact_details.get("PHONE")):
-                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 2 для сделки {deal_id}: У контакта {contact_id} нет номера телефона.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Новый лот', у контакта нет номера телефона.")
-                return {"status": "ok", "message": "Contact has no phone number"}
-            
-            client_name = contact_details.get("NAME", "Уважаемый клиент")
-            client_phone = normalize_phone(contact_details["PHONE"][0].get("VALUE"))
+            if not client_phone:
+                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 2 для сделки {deal_id}: Не удалось найти номер телефона ни у компании ({company_id}), ни у контакта ({contact_id}).")
+                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Новый лот', не найден номер телефона клиента.")
+                return {"status": "ok", "message": "No client phone number found for scenario 2"}
+
+
+
             manager = bitrix_service.get_user_details(manager_id)
             manager_name = f"{manager.get('NAME', '')} {manager.get('LAST_NAME', '')}".strip() if manager else "Ваш менеджер"
             
@@ -563,13 +845,38 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
             logger.info(f"  - Менеджер: {manager_name} ({manager_id})")
             logger.info(f"  - Инфо о лоте: {debtor_name_info}")
 
+            # 1. Получаем существующую историю диалога
+            current_history = db_service.get_dialog_history(db, client_phone)
+            logger.info(f"  - Найдено {len(current_history)} сообщений в истории для {client_phone}.")
+
+            # 2. Создаем системную команду для нового сценария
             initial_instruction = {
                 "role": "system",
                 "content": f"initiate_new_lot_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}. Для клиента {client_name} появился новый лот/должник ИНФОРМАЦИЯ О ДОЛЖНИКЕ: {debtor_name_info}."
             }
+            
+            # 3. Добавляем команду в КОНЕЦ существующей истории
+            current_history.append(initial_instruction)
+            
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+
             prompt_library = prompt_service.get_prompt_library()
-            all_prompts_text = "\n\n".join(prompt_library.values())
-            llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
+
+            # --- НАЧАЛО ИЗМЕНЕНИЙ ---
+            # Укажите ключи, нужные для сценария "Новый лот"
+            required_keys = [
+                "#start#", 
+                "#style#",
+                "#Dialog2#" # Специальный блок для этого сценария
+            ]
+            
+            prompt_parts = [prompt_library.get(key, "") for key in required_keys]
+            all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+            # 4. Отправляем в LLM ПОЛНУЮ историю с новой командой
+            llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
             if llm_decision:
                 db_service.log_llm_response(db, client_phone, llm_decision)
             if not llm_decision:
@@ -617,10 +924,13 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
                 current_history.append({"role": "assistant", "content": response_text})
             
             states_that_need_reminders = [
-                "awaiting_initial_response", "awaiting_debtor_clarification", 
-                "awaiting_debtor_details", "awaiting_new_lot_response",
-                "awaiting_touch_today_response"
-            ]
+                    "d1_awaiting_greeting_response",
+                    "d1_awaiting_debtor_clarification",
+                    "d1_awaiting_debtor_details",
+                    "d2_awaiting_lot_response",
+                    "d3_awaiting_touch_response",
+                    "d3_awaiting_details_after_touch"
+                ]
             should_remind = new_state in states_that_need_reminders
 
             db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)
@@ -649,40 +959,76 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
             # # --- КОНЕЦ БЛОКА ПРОВЕРКИ ЛИМИТА ---
 #___________________________________________________________________________________________________________________________________________________________________
             contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
+            company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None # !!! ДОБАВЛЕНО
             manager_id = int(deal_details.get("ASSIGNED_BY_ID")) if deal_details.get("ASSIGNED_BY_ID") else None
-
-            if not contact_id:
-                logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 3 для сделки {deal_id}: Отсутствует CONTACT_ID.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Касание сегодня', отсутствует ID контакта.")
-                return {"status": "error", "message": "No contact ID"}
 
             if not manager_id:
                 logger.error(f"❌ ОСТАНОВКА СЦЕНАРИЯ 3 для сделки {deal_id}: Отсутствует ASSIGNED_BY_ID (менеджер).")
                 bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Касание сегодня', отсутствует ID менеджера.")
                 return {"status": "error", "message": "No manager ID"}
 
-            contact_details = bitrix_service.get_contact_details(contact_id)
+            client_phone = None
+            client_name = "Уважаемый клиент"
+            phone_source = "Не найден"
+
+            # 1. Попытка получить телефон из связанной компании (приоритет)
+            if company_id:
+                company_details = bitrix_service.get_company_details(company_id)
+                if company_details and company_details.get("PHONE"):
+                    phone_data = company_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = company_details.get("TITLE", client_name) 
+                        phone_source = f"Компания {company_id}"
+                        logger.debug(f"  - Телефон найден у компании {company_id} для сделки {deal_id} (Сценарий 3).")
+
+            # 2. Если у компании нет телефона, пытаемся получить из связанного контакта
+            if not client_phone and contact_id:
+                contact_details = bitrix_service.get_contact_details_2(contact_id) # Используем get_contact_details_2
+                if contact_details and contact_details.get("PHONE"):
+                    phone_data = contact_details["PHONE"][0]
+                    if phone_data and phone_data.get("VALUE"):
+                        client_phone = normalize_phone(phone_data["VALUE"])
+                        client_name = contact_details.get("NAME", client_name)
+                        phone_source = f"Контакт {contact_id}"
+                        logger.debug(f"  - Телефон найден у контакта {contact_id} для сделки {deal_id} (Сценарий 3).")
             
-            if not (contact_details and contact_details.get("PHONE")):
-                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 3 для сделки {deal_id}: У контакта {contact_id} нет номера телефона.")
-                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Касание сегодня', у контакта нет номера телефона.")
-                return {"status": "ok", "message": "Contact has no phone number"}
-            
-            client_name = contact_details.get("NAME", "Уважаемый клиент")
-            client_phone = normalize_phone(contact_details["PHONE"][0].get("VALUE"))
+            if not client_phone:
+                logger.warning(f"⚠️ ОСТАНОВКА СЦЕНАРИЯ 3 для сделки {deal_id}: Не удалось найти номер телефона ни у компании ({company_id}), ни у контакта ({contact_id}).")
+                bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: Не удалось запустить сценарий 'Касание сегодня', не найден номер телефона клиента.")
+                return {"status": "ok", "message": "No client phone number found for scenario 3"}
+
+
             manager = bitrix_service.get_user_details(manager_id)
             manager_name = f"{manager.get('NAME', '')} {manager.get('LAST_NAME', '')}".strip() if manager else "Ваш менеджер"
             
             logger.info(f"  - Клиент: {client_name} ({client_phone})")
             logger.info(f"  - Менеджер: {manager_name} ({manager_id})")
 
+            
+            # 1. Получаем историю
+            current_history = db_service.get_dialog_history(db, client_phone)
+            logger.info(f"  - Найдено {len(current_history)} сообщений в истории для {client_phone}.")
+
+            # 2. Создаем команду для сценария "Касание сегодня"
             initial_instruction = {
                 "role": "system",
                 "content": f"initiate_touch_today_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}."
             }
+            current_history.append(initial_instruction)
+
+            # 3. Собираем промпт для этого сценария
             prompt_library = prompt_service.get_prompt_library()
-            all_prompts_text = "\n\n".join(prompt_library.values())
-            llm_decision = await llm_service.get_bot_decision([initial_instruction], all_prompts_text)
+            required_keys = [
+                "#start#", 
+                "#style#",
+                "#Dialog3#" # Специальный блок для этого касания
+            ]
+            prompt_parts = [prompt_library.get(key, "") for key in required_keys]
+            all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+
+            # 4. Отправляем в LLM
+            llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
             if llm_decision:
                 db_service.log_llm_response(db, client_phone, llm_decision)
             if not llm_decision:
@@ -730,10 +1076,13 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
                 current_history.append({"role": "assistant", "content": response_text})
             
             states_that_need_reminders = [
-                "awaiting_initial_response", "awaiting_debtor_clarification", 
-                "awaiting_debtor_details", "awaiting_new_lot_response",
-                "awaiting_touch_today_response"
-            ]
+                    "d1_awaiting_greeting_response",
+                    "d1_awaiting_debtor_clarification",
+                    "d1_awaiting_debtor_details",
+                    "d2_awaiting_lot_response",
+                    "d3_awaiting_touch_response",
+                    "d3_awaiting_details_after_touch"
+                ]
             should_remind = new_state in states_that_need_reminders
 
             db_service.update_dialog(db, client_phone, new_state, current_history, needs_reminder=should_remind)

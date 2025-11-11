@@ -35,8 +35,24 @@ def _send_message_with_retries(url: str, headers: dict, payload: dict) -> reques
 def send_message(phone_number: str, text: str, file_url: str = None, file_name: str = None) -> bool:
     """
     Универсальная функция для отправки текстового сообщения через Wazzup.
-    Теперь также может принимать информацию о файле.
+    Включает режим отладки в консоли, если DEBUG_CONSOLE_MODE=true.
     """
+    # --- НАЧАЛО ИЗМЕНЕНИЙ: ПРОВЕРКА РЕЖИМА ОТЛАДКИ ---
+    if os.getenv("DEBUG_CONSOLE_MODE") == "true":
+        print("\n" + "="*60)
+        print(f"🤖 === [БОТ ОТПРАВЛЯЕТ СООБЩЕНИЕ (РЕЖИМ КОНСОЛИ)] === 🤖")
+        print(f"    Кому: {phone_number}")
+        print(f"    Текст: {text}")
+        if file_url:
+            print(f"    Файл URL: {file_url}")
+        if file_name:
+            print(f"    Имя файла: {file_name}")
+        print("="*60 + "\n")
+        return True # Имитируем успешную отправку для остальной части программы
+    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+    # Весь ваш существующий код для отправки через Wazzup остается ниже без изменений.
+    # Он будет выполнен, только если DEBUG_CONSOLE_MODE не 'true'.
     if not all([API_URL, API_KEY, CHANNEL_ID]):
         logger.error("❌ Ошибка Wazzup: API_URL, API_KEY или CHANNEL_ID не заданы в .env. Сообщение не отправлено.")
         return False
