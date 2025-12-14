@@ -6,6 +6,7 @@ from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime, timedelta
 from .models import Dialog
+from datetime import datetime 
 
 # --- ВСЕ ФУНКЦИИ ПЕРЕПИСАНЫ НА АСИНХРОННЫЙ СТИЛЬ ---
 
@@ -123,7 +124,7 @@ async def add_pending_message(db: AsyncSession, chat_id: str, content: str, file
         message_data["file_name"] = file_name
 
     dialog.pending_messages.append(message_data)
-    dialog.pending_since = func.now() # func.now() работает и в async
+    dialog.pending_since = datetime.utcnow() # func.now() работает и в async
     
     flag_modified(dialog, "pending_messages")
     await db.commit()

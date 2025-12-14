@@ -34,3 +34,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .env
 credentials.json
 alembic.ini
+
+
+sudo systemctl stop arb_bot.service
+sudo systemctl restart arb_bot.service
+sudo journalctl -u arb_bot.service -f

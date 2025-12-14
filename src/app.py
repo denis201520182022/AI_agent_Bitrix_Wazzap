@@ -472,7 +472,7 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
         if is_target_scenario:
             logger.info(f"✅✅✅ ТРИГГЕР СЦЕНАРИЯ СРАБОТАЛ: Сделка {deal_id} на стадии '{current_stage}'.")
             
-            # --- ПРОВЕРКА ЛИМИТА (РАСКОММЕНТИРОВАНО И ИНТЕГРИРОВАНО) ---
+            #--- ПРОВЕРКА ЛИМИТА (РАСКОММЕНТИРОВАНО И ИНТЕГРИРОВАНО) ---
             try:
                 current_limit = int(await r.get(REDIS_KEYS["limit"]) or 0)
                 current_count = int(await r.get(REDIS_KEYS["count"]) or 0)
@@ -544,7 +544,7 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             elif current_stage == TOUCH_TODAY_STAGE_ID:
                 instruction_content = f"initiate_touch_today_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}."
                 required_prompt_keys = ["#start#", "#style#", "#Dialog3#"]
-
+            dialog = await db_service.get_or_create_dialog(db, client_phone, deal_id, manager_id, current_funnel_id)
             # --- ОБЩАЯ ОБРАБОТКА И ОТПРАВКА ---
             # ИЗМЕНЕНО: Добавлен await
             current_history = await db_service.get_dialog_history(db, client_phone)
@@ -569,7 +569,8 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             action = llm_decision.get("action")
             action_params = llm_decision.get("action_params", {})
             new_state = llm_decision.get("new_state")
-            
+            if new_state is None:
+                new_state = dialog.current_state
             if response_text:
                 # ИЗМЕНЕНО: Добавлен await
                 success = await wazzup_service.send_message(client_phone, response_text)

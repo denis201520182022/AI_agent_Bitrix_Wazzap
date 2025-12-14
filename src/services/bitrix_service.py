@@ -1,7 +1,7 @@
 import os
 import httpx # ИЗМЕНЕНО: Импортируем httpx вместо requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # ИЗМЕНЕНО: tenacity остается, но будет работать с async функциями
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log, RetryError
 
@@ -189,31 +189,35 @@ async def create_activity_for_deal(deal_id: int, responsible_id: int, subject: s
     """
     logger.info(f"Попытка создания дела для сделки {deal_id}, ответственный {responsible_id}.")
     # Расчет времени остается синхронным, ему не нужен async
-    deadline_time = (datetime.now() + timedelta(hours=3)).strftime('%Y-%m-%dT23:59:59')
 
+    # Расчет времени с явным указанием часового пояса UTC+3 (Москва)
+    tz_moscow = timezone(timedelta(hours=3))
+    deadline_time = (datetime.now() + timedelta(hours=3)).strftime('%Y-%m-%dT23:59:59')
+    #deadline_time = (datetime.now(tz_moscow) + timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%S%z')
+    # Добавляем %z, чтобы передать часовой пояс, например +03:00. 
+    # Это делает формат более надежным.
     # ИЗМЕНЕНО: Добавлен await
     data = await _make_bitrix_request(
         "crm.activity.todo.add.json",
         params={
-            "fields": { # ИЗМЕНЕНО: Современный API Битрикс24 часто требует параметры внутри "fields"
-                "OWNER_TYPE_ID": 2,
-                "OWNER_ID": deal_id,
-                "RESPONSIBLE_ID": responsible_id,
-                "DEADLINE": deadline_time,
-                "SUBJECT": subject,
-                "DESCRIPTION": description,
-            }
+            # ПРАВИЛЬНО: параметры передаются на верхнем уровне
+            "ownerTypeId": 2,
+            "ownerId": deal_id,
+            "responsibleId": responsible_id,
+            "deadline": deadline_time,
+            "subject": subject, # Используем camelCase, как ожидает API
+            "description": description,
         }
     )
-    # Важное примечание: метод crm.activity.todo.add может возвращать ID прямо в 'result'
-    if data and isinstance(data.get('result'), int):
-        created_id = data['result']
-        logger.info(f"✅ Успешно создано дело с ID: {created_id} для сделки {deal_id}")
+    if data and data['result'].get('id'):
+        created_id = data['result']['id']
+        logger.info(f"✅ Успешно создано универсальное дело с ID: {created_id} для сделки {deal_id}")
         return created_id
     else:
-        error_detail = data.get('error_description') if data else 'Нет ответа от API'
+        error_detail = data.get('error_description') or data.get('error', 'Неизвестно')
         logger.error(f"⚠️ Не удалось создать дело для сделки {deal_id}. Ошибка: %s. Ответ API: %s", error_detail, data)
         return None
+    
 # ИЗМЕНЕНО: Функция стала асинхронной
 async def add_comment_to_deal(deal_id: int, comment_text: str) -> bool:
     """
