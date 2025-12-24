@@ -267,6 +267,9 @@ async def process_pending_messages_worker():
                         required_keys = BASE_PROMPTS + specific_keys
                         prompt_parts = [prompt_library.get(key, "") for key in required_keys]
                         all_prompts_text = "\n\n".join(filter(None, prompt_parts))
+                        # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
+                        all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
+                        all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
                         system_prompt_addition = f"\n\nТекущее состояние диалога: {current_dialog_state}. Действуй строго в соответствии с этим состоянием."
                         
                         names_context = f"\n\nВАЖНАЯ ИНФОРМАЦИЯ: Имя клиента: {client_name}, Менеджер: {manager_name}."
@@ -390,6 +393,13 @@ async def reminder_worker():
                         contact_details = await bitrix_service.get_contact_details_2(contact_id)
                         if contact_details:
                             client_name = contact_details.get("NAME", client_name)
+                    # --- НОВОЕ: ПОЛУЧАЕМ ИМЯ МЕНЕДЖЕРА (если его не было в этом блоке) ---
+                    manager_name = "Ваш менеджер"
+                    if dialog.manager_id:
+                        mgr_data = await bitrix_service.get_user_details(dialog.manager_id)
+                        if mgr_data:
+                            manager_name = mgr_data.get('NAME', '').strip() or "Ваш менеджер"
+                    # -------------------------------------------------------------------
                     
                     reminder_level = dialog.reminder_level
                     instruction = None
@@ -412,7 +422,9 @@ async def reminder_worker():
                         required_keys = ["#start#", "#style#", "#Reminder#"]
                         prompt_parts = [prompt_library.get(key, "") for key in required_keys]
                         all_prompts_text = "\n\n".join(filter(None, prompt_parts))
-                        
+                        # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
+                        all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
+                        all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
                         llm_decision = await llm_service.get_bot_decision([{"role": "system", "content": instruction}], all_prompts_text)
                         
                         # --- ИСПРАВЛЕНИЕ: Читаем и "response_text" и "text" ---
@@ -630,7 +642,9 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             prompt_library = await asyncio.to_thread(prompt_service.get_prompt_library)
             prompt_parts = [prompt_library.get(key, "") for key in required_prompt_keys]
             all_prompts_text = "\n\n".join(filter(None, prompt_parts))
-
+            # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
+            all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
+            all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
             llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
             if llm_decision:
                 await db_service.log_llm_response(db, client_phone, llm_decision)
