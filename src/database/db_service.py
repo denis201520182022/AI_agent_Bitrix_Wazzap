@@ -245,8 +245,4 @@ async def get_dialog(db: AsyncSession, chat_id: str) -> Dialog | None:
     """
     stmt = select(Dialog).where(Dialog.chat_id == chat_id)
     result = await db.execute(stmt)
-<<<<<<< HEAD
     return result.scalars().first()
-=======
-    return result.scalars().first()
->>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
