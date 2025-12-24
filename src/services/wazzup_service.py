@@ -109,4 +109,8 @@ async def send_message(phone_number: str, text: str) -> bool:
             exc_info=True,
             extra={"target_phone": phone_number}
         )
+<<<<<<< HEAD
         return False
+=======
+        return False
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

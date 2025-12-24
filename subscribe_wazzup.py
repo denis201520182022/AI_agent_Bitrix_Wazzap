@@ -73,7 +73,11 @@ def subscribe_to_wazzup_webhooks():
     except requests.exceptions.RequestException as e:
         print("\n❌ Ошибка при подписке на вебхуки Wazzup:")
         print(f"   Детали ошибки: {e}")
+<<<<<<< HEAD
 
+=======
+        
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
         if e.response is not None:
             print(f"   Ответ сервера (статус {e.response.status_code}):")
             print(f"      Headers: {json.dumps(dict(e.response.headers), indent=2)}")

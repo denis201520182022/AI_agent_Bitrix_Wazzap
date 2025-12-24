@@ -20,4 +20,8 @@ if __name__ == "__main__":
         port=port, 
         reload=True, 
         log_config=None
+<<<<<<< HEAD
     )
+=======
+    )
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

@@ -127,4 +127,8 @@ def setup_logging():
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("multipart").setLevel(logging.WARNING)
 
+<<<<<<< HEAD
     return logger
+=======
+    return logger
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

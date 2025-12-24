@@ -356,4 +356,8 @@ async def get_contact_details_2(contact_id: int) -> dict | None:
         
     except Exception as e:
         logger.error(f"❌ Неожиданная ошибка при запросе контакта.", exc_info=True, extra={"contact_id": contact_id})
+<<<<<<< HEAD
         return None
+=======
+        return None
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

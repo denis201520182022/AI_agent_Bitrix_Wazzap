@@ -50,4 +50,8 @@ def fetch_and_print_channels():
             print(f"   Ответ сервера: {e.response.text}")
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     fetch_and_print_channels()
+=======
+    fetch_and_print_channels()
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

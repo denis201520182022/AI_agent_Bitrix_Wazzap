@@ -68,7 +68,11 @@ def _read_and_parse_doc(document_id: str) -> dict:
         logger.warning("ID документа не предоставлен для чтения.")
         return {}
         
+<<<<<<< HEAD
     logger.debug(f"Начало чтения Google Doc", extra={"doc_id": document_id})
+=======
+    logger.info(f"Начало чтения Google Doc", extra={"doc_id": document_id})
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
     try:
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('docs', 'v1', credentials=creds)
@@ -97,7 +101,11 @@ def _read_and_parse_doc(document_id: str) -> dict:
                 if text_block:
                     doc_library[marker] = text_block
         
+<<<<<<< HEAD
         logger.debug(
+=======
+        logger.info(
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
             f"✅ Документ успешно прочитан", 
             extra={"doc_id": document_id, "blocks_found": len(doc_library)}
         )
@@ -156,10 +164,18 @@ def get_prompt_library() -> dict:
         logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: Нет промптов и нет кэша. Использую hardcoded fallback.")
         return {"#ROLE_AND_STYLE#": "Ты - вежливый ассистент."}
 
+<<<<<<< HEAD
     logger.debug(
+=======
+    logger.info(
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
         f"✅ Библиотека промптов обновлена.", 
         extra={"total_blocks": len(merged_library), "source_docs": [MAIN_DOC_ID, KNOWLEDGE_BASE_DOC_ID]}
     )
     _cached_prompt_library = merged_library
     _cache_timestamp = current_time
+<<<<<<< HEAD
     return merged_library
+=======
+    return merged_library
+>>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07
