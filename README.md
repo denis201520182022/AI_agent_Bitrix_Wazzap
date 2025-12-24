@@ -1,7 +1,8 @@
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 
-
+sudo journalctl -u arb_bot.service -f -o cat | jq -R 'fromjson? // .'
+systemctl restart arb_bot.service
 
 
 (venv) PS D:\мое\забота\Wazzup_Bitrix> python get_stages.py
@@ -39,3 +40,12 @@ alembic.ini
 sudo systemctl stop arb_bot.service
 sudo systemctl restart arb_bot.service
 sudo journalctl -u arb_bot.service -f
+
+![alt text](image.png)
+
+Лайфхак для чтения глазами:
+Если ты смотришь логи на сервере, установи утилиту jq. Она делает JSON красивым:
+code
+Bash
+journalctl -u bot_service -n 50 -o cat | jq
+Тогда ты увидишь их цветными и структурированными.
