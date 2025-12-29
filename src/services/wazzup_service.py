@@ -67,8 +67,8 @@ async def send_message(phone_number: str, text: str) -> bool:
 
     payload = {
         "channelId": CHANNEL_ID,
-        "chatType": "whatsapp",
-        "chatId": phone_number,
+        "chatType": "telegram", 
+        "phone": phone_number,  # Передаем номер в поле phone
         "text": text
     }
     

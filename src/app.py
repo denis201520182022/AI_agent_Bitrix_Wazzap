@@ -693,29 +693,51 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
 
     return {"status": "ok", "message": "Webhook processed"}
 
+# src/app.py (фрагмент)
+
+# ... (предыдущий код остается без изменений)
 
 # --- ОБРАБОТЧИК WAZZUP ---
 @app.post("/webhook/wazzup")
 async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         data = await request.json()
+        
+        # Проверки на тестовые запросы и пустые сообщения
         if data.get("test") or "messages" not in data or not data["messages"]:
             return {"status": "ok"}
         
         message = data["messages"][0]
+        
+        # Игнорируем свои же исходящие сообщения
         if message.get("isEcho"):
             return {"status": "ok"}
 
         text = message.get("text")
-        chat_id = message.get("chatId")
         
-        if text and chat_id:
-            normalized_phone = normalize_phone(chat_id)
+        # --- ИЗМЕНЕННАЯ ЛОГИКА ПОЛУЧЕНИЯ ТЕЛЕФОНА ---
+        # 1. Пытаемся достать явный номер телефона из контакта (для Telegram)
+        contact_data = message.get("contact", {})
+        raw_phone = contact_data.get("phone")
+        
+        # 2. Если в контакте телефона нет, берем chatId (для WhatsApp это и есть номер)
+        if not raw_phone:
+            raw_phone = message.get("chatId")
             
-            # --- ИЗМЕНЕНИЕ: ПРОВЕРКА СУЩЕСТВОВАНИЯ ДИАЛОГА ---
+        if not raw_phone:
+            logger.warning("⚠️ Wazzup Webhook: Не удалось определить номер телефона (нет ни contact.phone, ни chatId).")
+            return {"status": "ok", "message": "No phone identifier found"}
+
+        normalized_phone = normalize_phone(raw_phone)
+        # -----------------------------------------------
+
+        if text and normalized_phone:
+            
+            # --- ПРОВЕРКА СУЩЕСТВОВАНИЯ ДИАЛОГА ---
             existing_dialog = await db_service.get_dialog(db, normalized_phone)
             
             # Если диалога нет ИЛИ в диалоге нет привязки к сделке/менеджеру - ИГНОРИРУЕМ
+            # Это защищает от спама с левых номеров, которых нет в CRM
             if not existing_dialog or not existing_dialog.deal_id:
                 logger.info(f"🚫 Wazzup: Сообщение пропущено (неизвестный номер или нет deal_id): {normalized_phone}")
                 return {"status": "ok", "message": "Unknown client ignored"}
@@ -725,7 +747,7 @@ async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get
             chat_id_ctx.set(normalized_phone)
             
             # ЛОГ: Показываем входящее сообщение
-            logger.info(f"📩 Wazzup входящее от {normalized_phone}: '{text}'")
+            logger.info(f"📩 Wazzup (TG) входящее от {normalized_phone}: '{text}'")
 
             await db_service.log_user_message(db, normalized_phone, text)
             await db_service.add_pending_message(db, normalized_phone, text)
