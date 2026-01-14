@@ -708,6 +708,13 @@ async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get
             return {"status": "ok"}
         
         message = data["messages"][0]
+
+        # --- НОВЫЙ БЛОК: Игнорируем все каналы, кроме Telegram ---
+        chat_type = message.get("chatType")
+        if chat_type != "telegram":
+            logger.info(f"🚫 Wazzup: Сообщение пропущено (канал не Telegram): {chat_type}")
+            return {"status": "ok", "message": f"Ignoring channel: {chat_type}"}
+        # --- КОНЕЦ НОВОГО БЛОКА ---
         
         # Игнорируем свои же исходящие сообщения
         if message.get("isEcho"):
