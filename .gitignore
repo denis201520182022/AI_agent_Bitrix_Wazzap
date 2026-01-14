@@ -12,14 +12,10 @@ __pycache__/
 .idea/
 .vscode/
 
+
 # ... (все предыдущие строки)
 credentials.json
-
 test/
 alembic.ini
 README.md
-<<<<<<< HEAD
 alembic/
-=======
-alembic/
->>>>>>> a4b78ad62f0af688240390a9d498809e9fab3a07

@@ -472,7 +472,7 @@ async def lifespan(app: FastAPI):
     jobstores = {'default': SQLAlchemyJobStore(url=DATABASE_URL_SCHEDULER)}
     scheduler = AsyncIOScheduler(jobstores=jobstores)
     scheduler.add_job(reminder_worker, 'interval', minutes=1, id='reminder_job', replace_existing=True)
-    scheduler.add_job(monthly_check_worker, 'cron', day=15, hour=12, minute=0, id='monthly_check_job', replace_existing=True)
+    scheduler.add_job(monthly_check_worker, 'cron', day=1, hour=12, minute=0, id='monthly_check_job', replace_existing=True)
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен.")
     
