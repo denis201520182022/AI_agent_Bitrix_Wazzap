@@ -246,3 +246,28 @@ async def get_dialog(db: AsyncSession, chat_id: str) -> Dialog | None:
     stmt = select(Dialog).where(Dialog.chat_id == chat_id)
     result = await db.execute(stmt)
     return result.scalars().first()
+
+
+
+async def log_event(db: AsyncSession, chat_id: str, event_type: str, data: dict):
+    """
+    Универсальная функция для записи любого события в full_log.
+    event_type: 'user_message', 'llm_decision', 'error', 'system_action', 'webhook'
+    """
+    stmt = select(Dialog).filter(Dialog.chat_id == chat_id)
+    result = await db.execute(stmt)
+    dialog = result.scalar_one_or_none()
+    
+    if dialog:
+        new_event = {
+            "timestamp": datetime.now().isoformat(),
+            "type": event_type,
+            "details": data
+        }
+        # Инициализируем лог, если он пустой
+        if dialog.full_log is None:
+            dialog.full_log = []
+        
+        # Добавляем событие (SQLAlchemy подхватит изменение JSONB)
+        dialog.full_log = dialog.full_log + [new_event]
+        await db.commit()

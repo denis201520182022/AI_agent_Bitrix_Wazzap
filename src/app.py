@@ -81,6 +81,7 @@ PROMPT_RECIPES = {
     "d2_awaiting_lot_response": ["#Dialog2#"],
     "d3_awaiting_touch_response": ["#Dialog3#"],
     "d3_awaiting_details_after_touch": ["#Dialog3#"],
+    "awaiting_touch_today_response": ["#Dialog3#"],
     "default": [] 
 }
 
@@ -172,7 +173,7 @@ async def monthly_check_worker():
                         
                         dialog.needs_reminder = False
                         dialog.reminder_level = 0
-                        dialog.current_state = 'awaiting_touch_today_response'
+                        dialog.current_state = 'd3_awaiting_touch_response'
                         db.add(dialog)
                         await db.commit()
                         logger.info(f"      - Диалог обновлен в БД.")
@@ -277,7 +278,7 @@ async def process_pending_messages_worker():
                         final_system_prompt = all_prompts_text + names_context + system_prompt_addition
                         llm_decision = await llm_service.get_bot_decision(current_history, final_system_prompt)
                         if llm_decision:
-                            await db_service.log_llm_response(db, dialog.chat_id, llm_decision)
+                            await db_service.log_event(db, dialog.chat_id, "llm_decision", llm_decision)
 
                         if not llm_decision:
                             logger.error(f"❌ LLM не вернул решение. Эскалация.")
@@ -307,11 +308,13 @@ async def process_pending_messages_worker():
                             if success:
                                 current_history.append({"role": "assistant", "content": response_text})
                             else:
-                                logger.error(f"❌ Не удалось отправить сообщение. Эскалация.")
+                                logger.error(f"❌ Не удалось отправить сообщение. Эскалация и остановка.")
                                 await bitrix_service.escalate_deal_to_manager(
                                     deal_id, manager_id,
                                     f"Критическая ошибка: Не удалось отправить сообщение клиенту {dialog.chat_id} через Wazzup."
                                 )
+                                # Если не отправилось — принудительно завершаем сценарий в базе
+                                new_state = "scenario_complete"
                         
                         comment = action_params.get("comment_text")
                         task_subject = action_params.get("task_subject")
@@ -434,6 +437,10 @@ async def reminder_worker():
                             logger.info(f"🤖 Бот напоминает: {reminder_text}")
                             success = await wazzup_service.send_message(dialog.chat_id, reminder_text)
                             if success:
+                                await db_service.log_event(db, dialog.chat_id, "reminder_sent", {
+                                    "level": dialog.reminder_level,
+                                    "text": reminder_text
+                                })
                                 dialog.reminder_level += 1
                                 dialog.updated_at = datetime.now() 
 
@@ -562,6 +569,11 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
 
         if is_target_scenario:
             logger.info(f"✅✅✅ ТРИГГЕР СЦЕНАРИЯ СРАБОТАЛ: Стадия '{current_stage}'.")
+                    # Записываем, что вебхук вообще пришел и прошел фильтры
+            await db_service.log_event(db, client_phone, "scenario_trigger", {
+                "stage": current_stage,
+                "deal_id": deal_id
+            })
             
             #--- ПРОВЕРКА ЛИМИТА ---
             try:
@@ -647,7 +659,7 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
             llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
             if llm_decision:
-                await db_service.log_llm_response(db, client_phone, llm_decision)
+                await db_service.log_event(db, dialog.chat_id, "llm_decision", llm_decision)
             
             if not llm_decision:
                 await bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: LLM не сгенерировал ответ.")
@@ -668,9 +680,16 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
                 logger.info(f"🤖 Бот хочет инициировать диалог: {response_text}")
                 success = await wazzup_service.send_message(client_phone, response_text)
                 if not success:
+                    await db_service.log_event(db, client_phone, "send_error", {
+                        "text": response_text,
+                        "channel": "wazzup/telegram"
+                    })
                     await bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот] Ошибка! Не удалось отправить сообщение на {client_phone}.")
-                    await bitrix_service.escalate_deal_to_manager(deal_id, manager_id, f"Критическая ошибка Wazzup: не удалось отправить сообщение на {client_phone}.")
-                    return {"status": "ok", "message": "Wazzup send failed"}
+                    await bitrix_service.escalate_deal_to_manager(deal_id, manager_id, f"Критическая ошибка Wazzup: не удалось отправить сообщение клиенту {client_phone}. Проверьте канал связи.")
+                    # 3. МЕНЯЕМ стейт на завершенный, чтобы бот больше не пытался ничего слать
+                    new_state = "scenario_complete" 
+                    logger.warning(f"⚠️ Сообщение не ушло. Переводим диалог {client_phone} в '{new_state}'")
+                    # УДАЛИЛИ return {"status": "ok", "message": "Wazzup send failed"}
             
             if action == "LOG_COMMENT" and action_params.get("comment_text"):
                 await bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот]: {action_params['comment_text']}")
@@ -758,6 +777,7 @@ async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get
 
             await db_service.log_user_message(db, normalized_phone, text)
             await db_service.add_pending_message(db, normalized_phone, text)
+            await db_service.log_event(db, normalized_phone, "user_message", {"text": text})
         
     except Exception as e:
         logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА в Wazzup вебхуке: %s", e, exc_info=True)
