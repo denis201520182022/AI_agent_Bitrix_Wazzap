@@ -12,8 +12,11 @@ __pycache__/
 .idea/
 .vscode/
 
+# Google Service Account credentials (contains private key)
 credentials.json
-test/
-alembic.ini
+
+# Docs (optional, remove if you want to track README)
 README.md
-alembic/
+
+# Test artifacts
+test/

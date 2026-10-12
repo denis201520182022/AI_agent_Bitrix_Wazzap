@@ -9,6 +9,25 @@ from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_t
 
 logger = logging.getLogger(__name__)
 
+JSON_FORMAT_INSTRUCTION = """
+Ответь строго в формате JSON без markdown-обёрток и без текста вокруг.
+Структура JSON:
+{
+  "response_text": "текст ответа клиенту на русском языке",
+  "action": "ONE_OF: LOG_COMMENT | CREATE_TASK_AND_LOG | ESCALATE_TO_MANAGER | SEND_MESSAGE",
+  "action_params": {
+    "comment_text": "текст комментария или задачи (если action требует)",
+    "task_deadline_hours": 24
+  },
+  "new_state": "idle | dialog_phase_1 | dialog_phase_2 | dialog_phase_3 | escalated"
+}
+Правила:
+- response_text всегда на русском.
+- action — строго одно из перечисленных значений.
+- action_params — объект с нужными полями в зависимости от action.
+- new_state — одно из допустимых состояний диалога.
+"""
+
 SQUID_PROXY_HOST = os.getenv("SQUID_PROXY_HOST")
 SQUID_PROXY_PORT = os.getenv("SQUID_PROXY_PORT")
 SQUID_PROXY_USER = os.getenv("SQUID_PROXY_USER")
