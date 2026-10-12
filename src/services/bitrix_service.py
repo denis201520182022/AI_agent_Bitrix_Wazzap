@@ -5,14 +5,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log, RetryError
 
-# --- Настройка логирования ---
+
 logger = logging.getLogger(__name__)
-# Если хендлеры не настроены (запуск скрипта напрямую), ставим базу. 
-# В app.py сработает setup_logging из logger_config.
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# --- Настройка ретраев для асинхронных запросов ---
+
 bitrix_retry_decorator = retry(
     stop=stop_after_attempt(3),
     wait=wait_fixed(2),
@@ -21,7 +19,6 @@ bitrix_retry_decorator = retry(
     reraise=True
 )
 
-# Получаем базовый URL
 BASE_URL = os.getenv("BITRIX_WEBHOOK_URL")
 
 
@@ -38,12 +35,10 @@ async def _make_bitrix_request(method_url: str, params: dict = None) -> dict | N
     
     try:
         async with httpx.AsyncClient() as client:
-            # Логируем параметры как структуру данных, а не часть строки
             logger.debug(
                 "Request to Bitrix24", 
                 extra={"url": full_url, "params": params, "method": method_url}
             )
-            
             response = await client.post(full_url, json=params, timeout=30.0)
         
         response.raise_for_status()
@@ -53,7 +48,6 @@ async def _make_bitrix_request(method_url: str, params: dict = None) -> dict | N
             error_code = data.get('error')
             error_desc = data.get('error_description', 'Unknown Bitrix API error')
             
-            # Структурная ошибка
             logger.error(
                 f"❌ Bitrix API Error: {error_code}", 
                 extra={
@@ -70,10 +64,9 @@ async def _make_bitrix_request(method_url: str, params: dict = None) -> dict | N
     except httpx.RequestError as e:
         logger.error(
             f"❌ Network error requesting Bitrix24 ({method_url})", 
-            exc_info=True, # Добавляет трейсбек для Sentry
+            exc_info=True,
             extra={"url": full_url}
         )
-        # tenacity поймает это и сделает повтор
     except RetryError as e:
         logger.error(
             f"❌ Failed to reach Bitrix24 after retries ({method_url})", 
@@ -115,7 +108,6 @@ async def get_deal_details(deal_id: int) -> dict | None:
     """
     (Асинхронно) Получает детальную информацию о сделке по ее ID.
     """
-    # deal_id берется из контекста логгера (из app.py), но для надежности можно добавить в extra
     logger.info("Запрос деталей сделки (simple)", extra={"target_deal_id": deal_id})
     data = await _make_bitrix_request(
         "crm.deal.get.json",

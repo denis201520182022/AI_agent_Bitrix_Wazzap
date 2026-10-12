@@ -8,12 +8,10 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError 
 from pathlib import Path
 
-# --- Настройка логирования ---
 logger = logging.getLogger(__name__)
 
-# --- Настройки ---
-MAIN_DOC_ID = os.getenv("GOOGLE_DOC_ID", "1b_EfaKe-iqZG4beYI9lVrCwj2tOMDvK5WqaevJopXVM") 
-KNOWLEDGE_BASE_DOC_ID = os.getenv("KNOWLEDGE_BASE_DOC_ID", "1TE1PJWGfSFksvcuh1Nyova91BaeegRlUBmVVeBAZ8iw")
+MAIN_DOC_ID = os.getenv("GOOGLE_DOC_ID") 
+KNOWLEDGE_BASE_DOC_ID = os.getenv("KNOWLEDGE_BASE_DOC_ID")
 SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
 SERVICE_ACCOUNT_FILE = Path(__file__).parent.parent.parent / 'credentials.json'
 CACHE_TTL_SECONDS = 120
@@ -36,16 +34,11 @@ def _parse_table_to_markdown(table: dict) -> str:
         logger.debug("Таблица пуста, возвращаем пустую строку.")
         return ""
 
-    # Обрабатываем первую строку (заголовок)
     header_row = rows[0]
     header_cells = [_get_text_from_cell(cell) for cell in header_row.get('tableCells', [])]
     markdown_table.append(f"| {' | '.join(header_cells)} |")
-
-    # Создаем разделитель
     separator = ["---"] * len(header_cells)
     markdown_table.append(f"| {' | '.join(separator)} |")
-
-    # Обрабатываем остальные строки
     for row in rows[1:]:
         body_cells = [_get_text_from_cell(cell) for cell in row.get('tableCells', [])]
         markdown_table.append(f"| {' | '.join(body_cells)} |")

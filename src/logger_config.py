@@ -7,14 +7,10 @@ from pythonjsonlogger import jsonlogger
 import requests
 import datetime
 
-# --- 1. Контекстные переменные ---
-# Они позволяют хранить данные (ID сделки, ID чата) в рамках одного запроса/воркера.
-# Нам не нужно передавать их в каждую функцию вручную.
 request_id_ctx = contextvars.ContextVar("request_id", default=None)
 deal_id_ctx = contextvars.ContextVar("deal_id", default=None)
 chat_id_ctx = contextvars.ContextVar("chat_id", default=None)
 
-# --- 2. Фильтр для добавления контекста в логи ---
 class ContextFilter(logging.Filter):
     """
     Этот фильтр автоматически добавляет значения из ContextVars в каждую запись лога.
@@ -32,7 +28,6 @@ class ContextFilter(logging.Filter):
             record.chat_id = c_id
         return True
 
-# --- 3. Обработчик для Telegram ---
 class TelegramBotHandler(logging.Handler):
     def __init__(self, token, chat_id):
         super().__init__()
@@ -40,18 +35,13 @@ class TelegramBotHandler(logging.Handler):
         self.chat_id = chat_id
 
     def emit(self, record):
-        # Отправляем только ERROR и CRITICAL
         if record.levelno < logging.ERROR:
             return
 
         try:
             log_entry = self.format(record)
-            
-            # Формируем сообщение с иконками для наглядности
             emoji = "🚨" if record.levelno == logging.ERROR else "🔥"
             title = "ERROR" if record.levelno == logging.ERROR else "CRITICAL"
-            
-            # Достаем контекст, если он есть
             context_info = ""
             if hasattr(record, 'deal_id'):
                 context_info += f"\n🆔 <b>Deal ID:</b> {record.deal_id}"
@@ -71,49 +61,32 @@ class TelegramBotHandler(logging.Handler):
                 "parse_mode": "HTML"
             }, timeout=5)
         except Exception:
-            # Никогда не роняем приложение из-за ошибки отправки лога
             pass
 
-# --- 4. Основная функция настройки ---
 def setup_logging():
-    # Получаем настройки из ENV
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     tg_token = os.getenv("TG_BOT_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
 
-    # Создаем корневой логгер
     logger = logging.getLogger()
     logger.setLevel(log_level)
-    
-    # Очищаем существующие хендлеры (чтобы не было дублей при перезагрузке uvicorn)
+
     if logger.handlers:
         logger.handlers.clear()
 
-    # --- Консольный Хендлер (JSON или Текст) ---
-    # Для продакшена лучше JSON, для локальной разработки можно оставить текст.
-    # Но для Графаны нужен JSON. Сделаем гибрид: структура JSON, но вывод в stdout.
     console_handler = logging.StreamHandler(sys.stdout)
-    
-    # Формат JSON. Мы указываем, какие поля хотим видеть.
-    # message - само сообщение, asctime - время, levelname - уровень.
-    # Поля из ContextFilter (deal_id и т.д.) добавятся автоматически, если они есть.
     formatter = jsonlogger.JsonFormatter(
         '%(asctime)s %(levelname)s %(name)s %(message)s',
         json_ensure_ascii=False,
         timestamp=True 
     )
     console_handler.setFormatter(formatter)
-    
-    # Добавляем фильтр контекста
     context_filter = ContextFilter()
     console_handler.addFilter(context_filter)
-    
     logger.addHandler(console_handler)
 
-    # --- Telegram Хендлер ---
     if tg_token and tg_chat_id:
         tg_handler = TelegramBotHandler(tg_token, tg_chat_id)
-        # В телеграм отправляем просто текст ошибки, JSON там читать неудобно
         tg_formatter = logging.Formatter('%(message)s')
         tg_handler.setFormatter(tg_formatter)
         tg_handler.addFilter(context_filter)
@@ -122,7 +95,6 @@ def setup_logging():
     else:
         logging.warning("⚠️ Telegram settings not found. Alerts disabled.")
 
-    # Отключаем лишний шум от библиотек
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("multipart").setLevel(logging.WARNING)

@@ -11,34 +11,26 @@ def parse_form_data(data: FormData) -> dict:
     """
     parsed_dict = {}
     for key, value in data.items():
-        # Разбираем ключ на части, например, 'data[FIELDS][ID]' -> ['data', 'FIELDS', 'ID']
         parts = key.replace("]", "").split("[")
-        
-        # Двигаемся по словарю, создавая вложенные словари по необходимости
         d = parsed_dict
         for part in parts[:-1]:
             if part not in d:
                 d[part] = {}
             d = d[part]
-        
-        # В конце присваиваем значение
+    
         d[parts[-1]] = value
         
     return parsed_dict
 
 def normalize_phone(phone_number: str) -> str:
-
     if not phone_number:
         return ""
-# re.sub(r'\D', '', ...) находит все не-цифры (\D) и заменяет их на пустую строку
     return re.sub(r'\D', '', phone_number)
 
 
 def is_working_hours():
-    # Устанавливаем часовой пояс МСК
     moscow_tz = pytz.timezone('Europe/Moscow')
     now = datetime.now(moscow_tz)
-    
     # Пн-Пт = 0-4
     is_weekday = now.weekday() < 5
     # Часы с 9:00 до 18:00

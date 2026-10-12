@@ -1,4 +1,4 @@
-# get_wazzup_channels.py
+# get_wazzup_channels.py          Скрпт для проверки подключенных каналов в Вазаппе
 import os
 import requests
 from dotenv import load_dotenv
@@ -17,7 +17,6 @@ def fetch_and_print_channels():
         print("❌ Ошибка: не удалось найти WAZZUP_API_URL или WAZZUP_API_KEY в файле .env")
         return
 
-    # Конечная точка API для получения списка каналов
     endpoint = "/channels"
     url = f"{API_URL}{endpoint}"
 
@@ -35,9 +34,7 @@ def fetch_and_print_channels():
         if data:
             print("\n--- ✅ СПИСОК ВАШИХ КАНАЛОВ WAZZUP ---")
             for channel in data:
-                # ВАЖНО: поле с ID называется 'id', а не 'channelId' в этом ответе
                 channel_id = channel.get('id')
-                # Название канала - это обычно номер телефона
                 channel_name = channel.get('name', 'Без имени')
                 print(f"Название: {channel_name:<20} | ID: {channel_id}")
             print("-----------------------------------------")

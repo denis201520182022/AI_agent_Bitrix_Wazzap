@@ -1,11 +1,10 @@
+# Скрипт для импорта уже существующих сделок в битриксе у клиента
+
 import os
 import asyncio
 from dotenv import load_dotenv
-
-# Загружаем переменные окружения из .env файла
 load_dotenv()
 
-# Импортируем необходимые сервисы и модели из вашего проекта
 from src.database.db import SessionLocal, engine, Base
 from src.database.models import Dialog 
 from src.database import db_service
@@ -15,14 +14,11 @@ from src.utils import normalize_phone
 import logging
 import traceback
 
-# --- Настройка логирования для скрипта ---
 logger = logging.getLogger(__name__)
-# Устанавливаем базовую конфигурацию логирования, если она еще не настроена
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# --- ЗАГРУЗКА НАСТРОЕК ИЗ .ENV ---
-TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID") 
+TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID") # айдишник воронки в битре
 
 async def import_legacy_deals():
     logger.info("🚀 Запуск скрипта импорта существующих сделок...")
@@ -33,7 +29,6 @@ async def import_legacy_deals():
 
     db = SessionLocal()
     
-    # Статистика импорта
     stats = {
         'total_deals_fetched': 0,
         'processed_deals': 0,
@@ -41,12 +36,11 @@ async def import_legacy_deals():
         'skipped_no_manager': 0,
         'skipped_no_phone': 0,
         'skipped_bitrix_api_error': 0,
-        'skipped_by_title_filter': 0, # <-- Добавил новый счетчик для статистики
+        'skipped_by_title_filter': 0, 
         'errors_db': 0
     }
     
     try:
-        # Получаем все сделки из Bitrix24.
         all_deals_simple_data = []
         start = 0
         
@@ -54,7 +48,6 @@ async def import_legacy_deals():
             logger.info(f"Запрашиваю сделки из Bitrix24, начиная с элемента {start}...")
             
             try:
-                # --- ИЗМЕНЕНИЕ 1: Добавлено "TITLE" в 'select' ---
                 bitrix_deals_response = bitrix_service._make_bitrix_request(
                     "crm.deal.list.json",
                     params={
@@ -62,7 +55,7 @@ async def import_legacy_deals():
                             "CATEGORY_ID": TARGET_FUNNEL_ID,
                             "!=STAGE_ID": "C11:UC_O7UAOV"
                         },
-                        'select': ["ID", "ASSIGNED_BY_ID", "CONTACT_ID", "TITLE"], # <-- "TITLE" добавлен здесь
+                        'select': ["ID", "ASSIGNED_BY_ID", "CONTACT_ID", "TITLE"],
                         'start': start
                     }
                 )
@@ -91,17 +84,14 @@ async def import_legacy_deals():
         stats['total_deals_fetched'] = len(all_deals_simple_data)
         logger.info(f"Найдено {stats['total_deals_fetched']} сделок в целевой воронке ID: {TARGET_FUNNEL_ID}.")
 
-        # Обрабатываем каждую сделку
         for idx, deal_simple_data in enumerate(all_deals_simple_data, 1):
             deal_id_for_log = deal_simple_data.get("ID", "N/A")
 
-            # --- ИЗМЕНЕНИЕ 2: Фильтрация по названию сделки ---
             deal_title = deal_simple_data.get("TITLE", "")
             if deal_title.endswith("(Привлечен доп должник)"):
                 logger.info(f"  - Пропускаю сделку {deal_id_for_log} с названием '{deal_title}', т.к. это доп. должник.")
                 stats['skipped_by_title_filter'] += 1
-                continue # Переходим к следующей сделке
-            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+                continue 
 
             stats['processed_deals'] += 1
             deal_id = int(deal_simple_data["ID"])

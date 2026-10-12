@@ -10,14 +10,11 @@ import traceback
 from contextlib import asynccontextmanager
 import aioconsole
 from fastapi import FastAPI, Request, Depends
-import sentry_sdk # Для мониторинга ошибок
-
-# ИЗМЕНЕНО: Импортируем компоненты БД и SQLAlchemy
+import sentry_sdk
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime, timedelta
-
 from database import db_service
 from database.db import AsyncSessionLocal
 from database.models import Dialog
@@ -26,11 +23,8 @@ from utils import parse_form_data, normalize_phone, is_working_hours
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 import redis.asyncio as aioredis
-
-# --- ИЗМЕНЕНО: Импорт нового конфига логгера ---
 from logger_config import setup_logging, request_id_ctx, deal_id_ctx, chat_id_ctx
 
-# --- Настройка Sentry (если задан DSN) ---
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
     sentry_sdk.init(
@@ -39,19 +33,12 @@ if SENTRY_DSN:
         profiles_sample_rate=1.0,
     )
 
-# --- Инициализация профессионального логгера ---
 logger = setup_logging()
-
-# --- URL для APScheduler ---
 DATABASE_URL_SCHEDULER = os.getenv("DATABASE_URL").replace("+asyncpg", "")
-
-# --- ЗАГРУЗКА НАСТРОЕК ИЗ .ENV ---
 TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID") 
 WELCOME_STAGE_ID = f"C{TARGET_FUNNEL_ID}:NEW" 
 NEW_LOT_STAGE_ID = os.getenv("NEW_LOT_STAGE_ID")
 TOUCH_TODAY_STAGE_ID = os.getenv("TOUCH_TODAY_STAGE_ID")
-
-# --- Redis Configuration ---
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 BOT_ID = "alpha_project"
@@ -67,7 +54,6 @@ async def get_redis_client():
         host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
     )
 
-# --- КНИГА РЕЦЕПТОВ ДЛЯ ПРОМПТОВ ---
 BASE_PROMPTS = [
     "#start#",
     "#style#",
@@ -85,7 +71,6 @@ PROMPT_RECIPES = {
     "default": [] 
 }
 
-# --- ЗАВИСИМОСТЬ ДЛЯ ПОЛУЧЕНИЯ АСИНХРОННОЙ СЕССИИ БД ---
 async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         try:
@@ -95,15 +80,12 @@ async def get_db() -> AsyncSession:
             await session.rollback()
             raise
 
-# --- ВОРКЕР ДЛЯ ВВОДА ИЗ КОНСОЛИ ---
 async def console_input_worker():
     logger.info("👨‍💻 Воркер консольного ввода запущен. Введите 'exit' для выхода.")
     
     chat_id = await aioconsole.ainput("Введите номер телефона (chat_id) для этого сеанса тестирования: ")
     if not chat_id:
         chat_id = "79991234567"
-    
-    # Устанавливаем контекст чата для логов
     chat_id_ctx.set(chat_id)
     logger.info(f"Тестирование диалога для: {chat_id}. Теперь можете отправлять сообщения.")
 
@@ -123,13 +105,9 @@ async def console_input_worker():
         except Exception as e:
             logger.error(f"Ошибка в воркере консольного ввода: {e}", exc_info=True)
 
-# --- ВОРКЕР ДЛЯ ЕЖЕМЕСЯЧНОЙ ПРОВЕРКИ ---
 async def monthly_check_worker():
     logger.info("🗓️ Воркер ежемесячной проверки запущен!")
-    
-    # Генерируем ID запроса для логов этого запуска воркера
     request_id_ctx.set(f"monthly-{uuid.uuid4().hex[:30]}")
-
     escalation_stage_id = os.getenv("TOUCH_TODAY_STAGE_ID")
     if not escalation_stage_id:
         logger.critical("❌ ОСТАНОВКА ВОРКЕРА ЕЖЕМЕСЯЧНОЙ ПРОВЕРКИ: Переменная TOUCH_TODAY_STAGE_ID не задана в .env.")
@@ -154,7 +132,6 @@ async def monthly_check_worker():
             logger.info(f"  - Найдено {len(inactive_dialogs)} диалогов для обработки.")
 
             for dialog in inactive_dialogs:
-                # Устанавливаем контекст для конкретного диалога
                 token_d = deal_id_ctx.set(dialog.deal_id)
                 token_c = chat_id_ctx.set(dialog.chat_id)
                 try:
@@ -186,7 +163,6 @@ async def monthly_check_worker():
                 except Exception as inner_e:
                     logger.error(f"❌ ОШИБКА при обработке диалога в monthly_worker: %s", inner_e, exc_info=True)
                 finally:
-                    # Сбрасываем контекст
                     deal_id_ctx.reset(token_d)
                     chat_id_ctx.reset(token_c)
 
@@ -197,12 +173,11 @@ async def monthly_check_worker():
     logger.info("✅ Воркер ежемесячной проверки завершен.")
 
 
-# --- ВОРКЕР-ДИСПЕТЧЕР ---
 async def process_pending_messages_worker():
     logger.info("🚀 Воркер-ДИСПЕТЧЕР запущен!")
     while True:
         if not is_working_hours():
-            await asyncio.sleep(60) # Спим минуту и проверяем снова
+            await asyncio.sleep(60)
             continue
         async with AsyncSessionLocal() as db:
             try:
@@ -210,20 +185,16 @@ async def process_pending_messages_worker():
                 
                 for batch in dialog_batches:
                     dialog = batch['dialog']
-                    
-                    # Устанавливаем контекст логов
                     token_req = request_id_ctx.set(f"proc-{uuid.uuid4().hex[:30]}")
                     token_c = chat_id_ctx.set(dialog.chat_id)
                     token_d = deal_id_ctx.set(dialog.deal_id) 
 
                     try:
-                        # Получаем актуальные детали сделки ПЕРЕД обработкой
                         deal_details = await bitrix_service.get_deal_details(dialog.deal_id) 
                         if deal_details and deal_details.get("STAGE_ID") == "C11:UC_W9JHF3":
                             logger.warning(f"Останавливаю обработку: сделка в стадии 'Номиналы'.")
                             continue
 
-                        # --- НОВЫЙ БЛОК: ПОЛУЧЕНИЕ ИМЕН ---
                         contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
                         company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None
                         
@@ -240,10 +211,8 @@ async def process_pending_messages_worker():
                         manager_name = "Ваш менеджер"
                         manager = await bitrix_service.get_user_details(dialog.manager_id)
                         if manager:
-                            # Берем только NAME (имя)
                             manager_name = manager.get('NAME', '').strip() or "Ваш менеджер"
                             print(manager_name)
-                        # -----------------------------------
 
 
                         pending_messages = batch['pending']
@@ -252,15 +221,11 @@ async def process_pending_messages_worker():
                             continue
 
                         logger.info(f"Обработка {len(pending_messages)} сообщений в состоянии '{dialog.current_state}'")
-
-                        # 1. ПОДГОТОВКА КОНТЕКСТА
                         current_history = await db_service.get_dialog_history(db, dialog.chat_id)
                         for msg in pending_messages:
-                            # ЛОГ: Показываем входящее сообщение
                             logger.info(f"📩 Входящее от {dialog.chat_id}: {msg['content']}")
                             current_history.append({"role": "user", "content": msg['content']})
 
-                        # 2. ПОЛУЧЕНИЕ РЕШЕНИЯ ОТ LLM
                         prompt_library = await asyncio.to_thread(prompt_service.get_prompt_library)
                         current_dialog_state = await db_service.get_dialog_state(db, dialog.chat_id)
 
@@ -268,7 +233,6 @@ async def process_pending_messages_worker():
                         required_keys = BASE_PROMPTS + specific_keys
                         prompt_parts = [prompt_library.get(key, "") for key in required_keys]
                         all_prompts_text = "\n\n".join(filter(None, prompt_parts))
-                        # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
                         all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
                         all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
                         system_prompt_addition = f"\n\nТекущее состояние диалога: {current_dialog_state}. Действуй строго в соответствии с этим состоянием."
@@ -289,7 +253,6 @@ async def process_pending_messages_worker():
                                 )
                             continue
 
-                        # --- ИСПРАВЛЕНИЕ: Читаем и "response_text" и "text" ---
                         response_text = llm_decision.get("response_text") or llm_decision.get("text")
                         
                         action = llm_decision.get("action")
@@ -302,7 +265,6 @@ async def process_pending_messages_worker():
                             continue
 
                         if response_text:
-                            # ЛОГ: Показываем ответ бота
                             logger.info(f"🤖 Бот отвечает: {response_text}")
                             success = await wazzup_service.send_message(dialog.chat_id, response_text)
                             if success:
@@ -313,7 +275,6 @@ async def process_pending_messages_worker():
                                     deal_id, manager_id,
                                     f"Критическая ошибка: Не удалось отправить сообщение клиенту {dialog.chat_id} через Wazzup."
                                 )
-                                # Если не отправилось — принудительно завершаем сценарий в базе
                                 new_state = "scenario_complete"
                         
                         comment = action_params.get("comment_text")
@@ -338,7 +299,6 @@ async def process_pending_messages_worker():
                         logger.info(f"  - Диалог переведен в состояние '{new_state}'.")
                     
                     finally:
-                        # Очищаем контекст после обработки диалога
                         request_id_ctx.reset(token_req)
                         chat_id_ctx.reset(token_c)
                         deal_id_ctx.reset(token_d)
@@ -350,22 +310,18 @@ async def process_pending_messages_worker():
         await asyncio.sleep(5)
 
 
-# --- ВОРКЕР-НАПОМИНАТОР ---
 async def reminder_worker():
     logger.debug("⏰ Воркер-НАПОМИНАТОР запущен!")
     async with AsyncSessionLocal() as db:
         if not is_working_hours():
-            return # Просто выходим, планировщик вызовет нас снова через минуту
+            return 
         try:
             dialogs_to_remind = await db_service.get_due_reminders(db)
             if not dialogs_to_remind:
-                # Не спамим в логи, если нечего делать
                 return
 
             logger.info(f"  - Найдено {len(dialogs_to_remind)} диалогов для напоминания.")
-            
             for dialog in dialogs_to_remind:
-                # Устанавливаем контекст
                 token_req = request_id_ctx.set(f"remind-{uuid.uuid4().hex[:30]}")
                 token_c = chat_id_ctx.set(dialog.chat_id)
                 token_d = deal_id_ctx.set(dialog.deal_id)
@@ -381,8 +337,6 @@ async def reminder_worker():
                         dialog.needs_reminder = False 
                         await db.commit()
                         continue
-                    
-                    # ... Логика получения имен ...
                     contact_id = int(deal_details.get("CONTACT_ID")) if deal_details.get("CONTACT_ID") else None
                     company_id = int(deal_details.get("COMPANY_ID")) if deal_details.get("COMPANY_ID") else None
                     client_name = "Уважаемый клиент"
@@ -396,14 +350,11 @@ async def reminder_worker():
                         contact_details = await bitrix_service.get_contact_details_2(contact_id)
                         if contact_details:
                             client_name = contact_details.get("NAME", client_name)
-                    # --- НОВОЕ: ПОЛУЧАЕМ ИМЯ МЕНЕДЖЕРА (если его не было в этом блоке) ---
                     manager_name = "Ваш менеджер"
                     if dialog.manager_id:
                         mgr_data = await bitrix_service.get_user_details(dialog.manager_id)
                         if mgr_data:
                             manager_name = mgr_data.get('NAME', '').strip() or "Ваш менеджер"
-                    # -------------------------------------------------------------------
-                    
                     reminder_level = dialog.reminder_level
                     instruction = None
                     if reminder_level == 0: instruction = f"initiate_reminder_1h. ИМЯ_КЛИЕНТА: {client_name}."
@@ -425,12 +376,9 @@ async def reminder_worker():
                         required_keys = ["#start#", "#style#", "#Reminder#"]
                         prompt_parts = [prompt_library.get(key, "") for key in required_keys]
                         all_prompts_text = "\n\n".join(filter(None, prompt_parts))
-                        # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
                         all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
                         all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
                         llm_decision = await llm_service.get_bot_decision([{"role": "system", "content": instruction}], all_prompts_text)
-                        
-                        # --- ИСПРАВЛЕНИЕ: Читаем и "response_text" и "text" ---
                         reminder_text = llm_decision.get("response_text") or llm_decision.get("text")
                         
                         if reminder_text:
@@ -470,8 +418,6 @@ async def reminder_worker():
             logger.critical(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА В ВОРКЕРЕ НАПОМИНАНИЙ: %s", e, exc_info=True)
             await db.rollback()
 
-
-# --- УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ ПРИЛОЖЕНИЯ ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Приложение запускается...")
@@ -503,9 +449,14 @@ async def lifespan(app: FastAPI):
     logger.info("Все воркеры и планировщик остановлены.")
     logger.info("Приложение остановлено.")
 
+
+
+
+
+
+
 app = FastAPI(title="Bitrix Wazzup Bot", lifespan=lifespan)
 
-# --- MIDDLEWARE ДЛЯ LOGGING CONTEXT ---
 @app.middleware("http")
 async def add_process_context(request: Request, call_next):
     """
@@ -523,8 +474,6 @@ async def add_process_context(request: Request, call_next):
 async def read_root():
     return {"status": "ok", "message": "Bot is running"}
 
-
-# --- ОБРАБОТЧИК ВЕБХУКОВ BITRIX24 ---
 @app.post("/webhook/bitrix")
 async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     deal_id_str = "Unknown"
@@ -540,7 +489,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             return {"status": "error", "message": "No deal ID"}
         
         deal_id = int(deal_id_str)
-        # Устанавливаем контекст сделки
         deal_id_ctx.set(deal_id)
         
         logger.info(f"Получен вебхук ONCRMDEALUPDATE")
@@ -552,8 +500,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
 
         current_funnel_id = str(deal_details.get("CATEGORY_ID"))
         current_stage = deal_details.get("STAGE_ID")
-
-        # --- НОВАЯ ЛОГИКА: ФИЛЬТРАЦИЯ ПО REDIS ---
         redis_stage_key = f"deal:{deal_id}:stage"
         last_known_stage = await r.get(redis_stage_key)
 
@@ -563,13 +509,10 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
 
         await r.set(redis_stage_key, current_stage)
         logger.info(f"✅ Обнаружена смена стадии (или новый статус): {last_known_stage} -> {current_stage}")
-        
-        # --- ОБЩАЯ ЛОГИКА ДЛЯ ВСЕХ СЦЕНАРИЕВ ---
         is_target_scenario = current_funnel_id == TARGET_FUNNEL_ID and current_stage in [WELCOME_STAGE_ID, NEW_LOT_STAGE_ID, TOUCH_TODAY_STAGE_ID]
 
         if is_target_scenario:
             logger.info(f"✅✅✅ ТРИГГЕР СЦЕНАРИЯ СРАБОТАЛ: Стадия '{current_stage}'.")
-                    # Записываем, что вебхук вообще пришел и прошел фильтры
             await db_service.log_event(db, client_phone, "scenario_trigger", {
                 "stage": current_stage,
                 "deal_id": deal_id
@@ -617,15 +560,10 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
                 await bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: не найден номер телефона клиента.")
                 return {"status": "ok", "message": "No client phone number found"}
             
-            # Устанавливаем контекст чата
             chat_id_ctx.set(client_phone)
-
             manager = await bitrix_service.get_user_details(manager_id)
-            # Берем только NAME
             manager_name = manager.get('NAME', '').strip() if manager else "Ваш менеджер"
-            
             logger.info(f"  - Клиент: {client_name} ({client_phone}), Менеджер: {manager_name} ({manager_id})")
-
             # --- ВЫБОР СЦЕНАРИЯ ---
             instruction_content = ""
             required_prompt_keys = []
@@ -654,7 +592,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
             prompt_library = await asyncio.to_thread(prompt_service.get_prompt_library)
             prompt_parts = [prompt_library.get(key, "") for key in required_prompt_keys]
             all_prompts_text = "\n\n".join(filter(None, prompt_parts))
-            # --- НОВОЕ: ПОДСТАНОВКА ПЛЕЙСХОЛДЕРОВ ---
             all_prompts_text = all_prompts_text.replace("[имя клиента]", client_name)
             all_prompts_text = all_prompts_text.replace("[имя менеджера]", manager_name)
             llm_decision = await llm_service.get_bot_decision(current_history, all_prompts_text)
@@ -665,8 +602,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
                 await bitrix_service.add_comment_to_deal(deal_id, "[Чат-бот] Ошибка: LLM не сгенерировал ответ.")
                 await bitrix_service.escalate_deal_to_manager(deal_id, manager_id, "Критическая ошибка: LLM не сгенерировал ответ.")
                 return {"status": "error", "message": "LLM failed"}
-            
-            # --- ИСПРАВЛЕНИЕ: Читаем и "response_text" и "text" ---
             response_text = llm_decision.get("response_text") or llm_decision.get("text")
             
             action = llm_decision.get("action")
@@ -676,7 +611,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
                 new_state = dialog.current_state
             
             if response_text:
-                # ЛОГ: Показываем ответ бота
                 logger.info(f"🤖 Бот хочет инициировать диалог: {response_text}")
                 success = await wazzup_service.send_message(client_phone, response_text)
                 if not success:
@@ -686,15 +620,12 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
                     })
                     await bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот] Ошибка! Не удалось отправить сообщение на {client_phone}.")
                     await bitrix_service.escalate_deal_to_manager(deal_id, manager_id, f"Критическая ошибка Wazzup: не удалось отправить сообщение клиенту {client_phone}. Проверьте канал связи.")
-                    # 3. МЕНЯЕМ стейт на завершенный, чтобы бот больше не пытался ничего слать
                     new_state = "scenario_complete" 
                     logger.warning(f"⚠️ Сообщение не ушло. Переводим диалог {client_phone} в '{new_state}'")
-                    # УДАЛИЛИ return {"status": "ok", "message": "Wazzup send failed"}
             
             if action == "LOG_COMMENT" and action_params.get("comment_text"):
                 await bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот]: {action_params['comment_text']}")
 
-            # Обновляем диалог в любом случае
             await db_service.get_or_create_dialog(db, client_phone, deal_id, manager_id, current_funnel_id)
             if response_text:
                 current_history = await db_service.get_dialog_history(db, client_phone)
@@ -712,10 +643,6 @@ async def handle_bitrix_webhook(request: Request, db: AsyncSession = Depends(get
 
     return {"status": "ok", "message": "Webhook processed"}
 
-# src/app.py (фрагмент)
-
-# ... (предыдущий код остается без изменений)
-
 # --- ОБРАБОТЧИК WAZZUP ---
 @app.post("/webhook/wazzup")
 async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get_db)):
@@ -725,23 +652,16 @@ async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get
         # Проверки на тестовые запросы и пустые сообщения
         if data.get("test") or "messages" not in data or not data["messages"]:
             return {"status": "ok"}
-        
         message = data["messages"][0]
-
-        # --- НОВЫЙ БЛОК: Игнорируем все каналы, кроме Telegram ---
         chat_type = message.get("chatType")
         if chat_type != "telegram":
             logger.info(f"🚫 Wazzup: Сообщение пропущено (канал не Telegram): {chat_type}")
             return {"status": "ok", "message": f"Ignoring channel: {chat_type}"}
-        # --- КОНЕЦ НОВОГО БЛОКА ---
-        
         # Игнорируем свои же исходящие сообщения
         if message.get("isEcho"):
             return {"status": "ok"}
 
         text = message.get("text")
-        
-        # --- ИЗМЕНЕННАЯ ЛОГИКА ПОЛУЧЕНИЯ ТЕЛЕФОНА ---
         # 1. Пытаемся достать явный номер телефона из контакта (для Telegram)
         contact_data = message.get("contact", {})
         raw_phone = contact_data.get("phone")
@@ -755,24 +675,14 @@ async def handle_wazzup_webhook(request: Request, db: AsyncSession = Depends(get
             return {"status": "ok", "message": "No phone identifier found"}
 
         normalized_phone = normalize_phone(raw_phone)
-        # -----------------------------------------------
-
         if text and normalized_phone:
-            
-            # --- ПРОВЕРКА СУЩЕСТВОВАНИЯ ДИАЛОГА ---
             existing_dialog = await db_service.get_dialog(db, normalized_phone)
-            
             # Если диалога нет ИЛИ в диалоге нет привязки к сделке/менеджеру - ИГНОРИРУЕМ
             # Это защищает от спама с левых номеров, которых нет в CRM
             if not existing_dialog or not existing_dialog.deal_id:
                 logger.info(f"🚫 Wazzup: Сообщение пропущено (неизвестный номер или нет deal_id): {normalized_phone}")
                 return {"status": "ok", "message": "Unknown client ignored"}
-            # ----------------------------------------------------
-
-            # Устанавливаем контекст для логов
             chat_id_ctx.set(normalized_phone)
-            
-            # ЛОГ: Показываем входящее сообщение
             logger.info(f"📩 Wazzup (TG) входящее от {normalized_phone}: '{text}'")
 
             await db_service.log_user_message(db, normalized_phone, text)

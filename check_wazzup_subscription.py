@@ -35,8 +35,6 @@ def check_wazzup_subscription():
 
         print("\n🎉 Получен ответ от Wazzup:")
         print(f"   Статус код: {response.status_code}")
-        
-        # Красиво выводим JSON
         response_data = response.json()
         print("   Тело ответа:")
         print(json.dumps(response_data, indent=2, ensure_ascii=False))

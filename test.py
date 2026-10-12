@@ -24,7 +24,7 @@ def get_wazzup_webhook_address():
 
     try:
         response = requests.get(url, headers=headers)
-        response.raise_for_status() # Вызовет исключение для HTTP ошибок (4xx или 5xx)
+        response.raise_for_status()
         
         webhook_info = response.json()
         print("✅ Успешно получен текущий адрес вебхуков Wazzup:")

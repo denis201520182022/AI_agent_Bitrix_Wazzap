@@ -2,12 +2,11 @@
 import os
 import requests
 from dotenv import load_dotenv
-import json # Импортируем для красивого вывода JSON
+import json
 
 def subscribe_to_wazzup_webhooks():
     """
     Отправляет PATCH-запрос в Wazzup для подписки на получение вебхуков.
-    Логирует полный запрос и ответ.
     """
     print("Загружаем переменные окружения...")
     load_dotenv()
@@ -19,22 +18,17 @@ def subscribe_to_wazzup_webhooks():
         print("❌ Ошибка: не удалось найти WAZZUP_API_URL или WAZZUP_API_KEY в .env файле.")
         return
 
-    # --- ВАЖНО: ВСТАВЬТЕ СЮДА ВАШ АКТУАЛЬНЫЙ NGROK URL ---
-    # Он должен быть запущен и указывать на ваш порт 8001 (согласно вашим логам)
-    NGROK_URL = "http://212.193.26.118:8001"
-    # ---------------------------------------------------------
+    # --- ВСТАВЬТЕ СЮДА АКТУАЛЬНЫЙ URL ---
+    # Он должен быть запущен и указывать на ваш порт
+    NGROK_URL = "http://..."
 
-    if "your-unique-url" in NGROK_URL or NGROK_URL == "http://212.193.26.118:8001": # Добавил проверку на ваш тестовый IP
+    if "your-unique-url" in NGROK_URL or NGROK_URL == "http://...": 
         print("\n!!! ПОЖАЛУЙСТА, УБЕДИТЕСЬ, ЧТО NGROK_URL АКТУАЛЕН И УКАЗЫВАЕТ НА ВАШ РАБОТАЮЩИЙ СЕРВЕР !!!\n")
         print(f"!!! Текущий NGROK_URL: {NGROK_URL} !!!\n")
-        # return # Закомментировал return, чтобы скрипт продолжал работать с указанным IP, но вывел предупреждение.
-               # Если вы не уверены, что этот IP ваш ngrok или публичный IP вашего сервера, раскомментируйте return.
-
-    # Формируем полный URL для вебхуков, который Wazzup будет вызывать
+        
     webhook_uri = f"{NGROK_URL}/webhook/wazzup"
 
-    # Готовим запрос
-    url = f"{API_URL}/webhooks" # Эндпоинт для работы с вебхуками
+    url = f"{API_URL}/webhooks"
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -42,7 +36,7 @@ def subscribe_to_wazzup_webhooks():
     payload = {
         "webhooksUri": webhook_uri,
         "subscriptions": {
-            "messagesAndStatuses": True # Подписываемся на сообщения и статусы
+            "messagesAndStatuses": True
         }
     }
 
@@ -55,15 +49,15 @@ def subscribe_to_wazzup_webhooks():
     print("-" * 50)
 
     try:
-        response = requests.patch(url, headers=headers, json=payload, timeout=10) # Добавим таймаут
+        response = requests.patch(url, headers=headers, json=payload, timeout=10)
 
         print("\n🎉 Получен ответ от Wazzup:")
         print(f"   Статус код: {response.status_code}")
-        print(f"   Headers: {json.dumps(dict(response.headers), indent=2)}") # Преобразуем заголовки в dict для вывода
+        print(f"   Headers: {json.dumps(dict(response.headers), indent=2)}")
         print(f"   Тело ответа: {response.text}")
         print("-" * 50)
 
-        response.raise_for_status() # Вызовет исключение для статусов 4xx/5xx
+        response.raise_for_status()
 
         print("\n✅ Успешно! Wazzup принял запрос на подписку.")
         print(f"   Вебхуки будут отправляться на: {webhook_uri}")

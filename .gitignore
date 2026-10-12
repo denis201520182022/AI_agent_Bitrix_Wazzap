@@ -12,8 +12,6 @@ __pycache__/
 .idea/
 .vscode/
 
-
-# ... (все предыдущие строки)
 credentials.json
 test/
 alembic.ini

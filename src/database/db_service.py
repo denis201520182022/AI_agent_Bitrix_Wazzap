@@ -1,17 +1,13 @@
 # src/database/db_service.py
 
 import logging
-# Импортируем асинхронную сессию и конструктор запросов select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime, timedelta
 from .models import Dialog
 
-# --- Настройка логирования ---
 logger = logging.getLogger(__name__)
-
-# --- ВСЕ ФУНКЦИИ ПЕРЕПИСАНЫ НА АСИНХРОННЫЙ СТИЛЬ ---
 
 async def get_or_create_dialog(db: AsyncSession, chat_id: str, deal_id: int = None, manager_id: int = None, funnel_id: str = None) -> Dialog:
     """
@@ -99,8 +95,6 @@ async def add_message_to_history(db: AsyncSession, chat_id: str, role: str, cont
     dialog.history.append({"role": role, "content": content})
     flag_modified(dialog, "history")
     await db.commit()
-    
-    # Логируем добавление, но обрезаем контент если он слишком длинный
     content_preview = content[:50] + "..." if len(content) > 50 else content
     logger.info(
         f"📝 Сообщение сохранено в историю", 
@@ -119,7 +113,6 @@ async def log_user_message(db: AsyncSession, chat_id: str, content: str):
     dialog.full_log.append(log_entry)
     flag_modified(dialog, "full_log")
     await db.commit()
-    # Логирование в консоль происходит в add_pending_message или app.py, здесь дублировать не обязательно
 
 
 async def log_llm_response(db: AsyncSession, chat_id: str, llm_response_json: dict):
@@ -264,10 +257,8 @@ async def log_event(db: AsyncSession, chat_id: str, event_type: str, data: dict)
             "type": event_type,
             "details": data
         }
-        # Инициализируем лог, если он пустой
         if dialog.full_log is None:
             dialog.full_log = []
         
-        # Добавляем событие (SQLAlchemy подхватит изменение JSONB)
         dialog.full_log = dialog.full_log + [new_event]
         await db.commit()
